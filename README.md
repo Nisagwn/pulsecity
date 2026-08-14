@@ -37,16 +37,16 @@ izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
 ## Klasör yapısı
 
 ```
-.github/workflows/       # CI/CD (lint, test, uçtan uca test, imaj yayınlama)
-pulsecity/
+.
 ├── docker-compose.yml       # Kafka, ScyllaDB, producer, consumer, webviz, Prometheus, Grafana
 ├── producer/                # Go load generator (sanal araç GPS ping üreteci)
 ├── consumer/                # Go consumer (Kafka -> ScyllaDB, DLQ, anomali tespiti)
 ├── webviz/                  # Go WebSocket servisi + Leaflet canlı harita (Faz 9)
 ├── scylla-init/schema.cql   # ScyllaDB şema tanımı
-├── monitoring/               # Prometheus config + Grafana provisioning/dashboard
-├── scripts/                  # zero-loss testi, benchmark, chaos testing scriptleri
-└── deploy/                   # Production/CI compose override, Nginx, VPS deployment rehberi
+├── monitoring/              # Prometheus config + Grafana provisioning/dashboard
+├── scripts/                 # zero-loss testi, benchmark, chaos testing scriptleri
+├── deploy/                  # Production/CI compose override, Nginx, VPS deployment rehberi
+└── .github/workflows/       # CI/CD (lint, test, uçtan uca test, imaj yayınlama)
 ```
 
 ## Hızlı başlangıç (local)

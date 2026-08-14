@@ -27,7 +27,7 @@ Docker internal network üzerinden birbirine erişiyor.
 ## 3. Projeyi VPS'e taşı
 
 ```bash
-git clone <repo-url> pulsecity
+git clone https://github.com/Nisagwn/pulsecity.git
 cd pulsecity
 cp .env.example .env
 nano .env   # GRAFANA_ADMIN_PASSWORD'ü mutlaka değiştir

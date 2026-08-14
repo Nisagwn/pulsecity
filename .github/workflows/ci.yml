@@ -1,8 +1,5 @@
 name: CI
 
-# Not: proje deponun kökünde değil, pulsecity/ alt klasöründe duruyor.
-# Bu yüzden tüm job'larda working-directory ayarlanıyor.
-
 on:
   push:
     branches: ["**"]
@@ -23,14 +20,14 @@ jobs:
         module: [producer, consumer, webviz]
     defaults:
       run:
-        working-directory: pulsecity/${{ matrix.module }}
+        working-directory: ${{ matrix.module }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: pulsecity/${{ matrix.module }}/go.sum
+          cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: gofmt kontrolü
         run: |
@@ -57,14 +54,14 @@ jobs:
         module: [producer, consumer, webviz]
     defaults:
       run:
-        working-directory: pulsecity/${{ matrix.module }}
+        working-directory: ${{ matrix.module }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: pulsecity/${{ matrix.module }}/go.sum
+          cache-dependency-path: ${{ matrix.module }}/go.sum
 
       # -race yarış koşullarını yakalar: producer 8 goroutine ile paralel
       # üretiyor, consumer zone başına paralel yazıyor, webviz eşzamanlı
@@ -77,9 +74,6 @@ jobs:
     name: Uçtan uca boru hattı
     runs-on: ubuntu-latest
     needs: [lint-build, test]
-    defaults:
-      run:
-        working-directory: pulsecity
     steps:
       - uses: actions/checkout@v4
 
@@ -201,7 +195,7 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
-          context: pulsecity/${{ matrix.module }}
+          context: ${{ matrix.module }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -221,7 +215,7 @@ jobs:
   #   VPS_USER     - SSH kullanıcısı (docker grubunda olmalı)
   #   VPS_SSH_KEY  - private key (passphrase'siz)
   #
-  # Detaylı sunucu hazırlığı için: pulsecity/deploy/DEPLOY.md
+  # Detaylı sunucu hazırlığı için: deploy/DEPLOY.md
   deploy:
     name: VPS'e dağıt (manuel)
     runs-on: ubuntu-latest
@@ -240,6 +234,5 @@ jobs:
             set -e
             cd ~/pulsecity
             git pull --ff-only
-            cd pulsecity
             docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d --build
             docker compose ps

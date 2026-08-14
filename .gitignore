@@ -22,3 +22,6 @@ coverage.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Claude Code yerel arac yapilandirmasi (projeye ait degil)
+.claude/
