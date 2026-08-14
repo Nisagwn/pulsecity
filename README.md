@@ -37,16 +37,16 @@ izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
 ## Klasör yapısı
 
 ```
-.github/workflows/       # CI/CD (lint, test, uçtan uca test, imaj yayınlama)
-pulsecity/
+.
 ├── docker-compose.yml       # Kafka, ScyllaDB, producer, consumer, webviz, Prometheus, Grafana
 ├── producer/                # Go load generator (sanal araç GPS ping üreteci)
 ├── consumer/                # Go consumer (Kafka -> ScyllaDB, DLQ, anomali tespiti)
 ├── webviz/                  # Go WebSocket servisi + Leaflet canlı harita (Faz 9)
 ├── scylla-init/schema.cql   # ScyllaDB şema tanımı
-├── monitoring/               # Prometheus config + Grafana provisioning/dashboard
-├── scripts/                  # zero-loss testi, benchmark, chaos testing scriptleri
-└── deploy/                   # Production/CI compose override, Nginx, VPS deployment rehberi
+├── monitoring/              # Prometheus config + Grafana provisioning/dashboard
+├── scripts/                 # zero-loss testi, benchmark, chaos testing scriptleri
+├── deploy/                  # Production/CI compose override, Nginx, VPS deployment rehberi
+└── .github/workflows/       # CI/CD (lint, test, uçtan uca test, imaj yayınlama)
 ```
 
 ## Hızlı başlangıç (local)
@@ -96,8 +96,37 @@ Uçtan uca happy-path: producer → Kafka → consumer → ScyllaDB. `docker-com
   grubuyla çalışır (data race'siz)
 - Consumer: mesajlar `zone_id`'ye göre gruplanır, her grup paralel `UnloggedBatch`
   ile yazılır; batch boyutu 2000'e çıkarıldı
-- Ölçüm: `./scripts/benchmark.sh 300` — Prometheus'tan throughput/p99 metriklerini çekip
-  `benchmark-results.md` üretir
+- Ölçüm: `./scripts/benchmark.sh 300` — hedef hızda ayağa kaldırır, Prometheus'tan
+  throughput/gecikme/lag metriklerini çekip `benchmark-results.md` üretir
+
+**Ölçülen sonuç — hedef tutturuldu.** 180 saniyelik ölçüm (+60sn ısınma):
+
+| Metrik | Değer |
+|---|---|
+| Üretilen throughput | **51.193 msg/sn** |
+| İşlenen throughput | **50.477 msg/sn** |
+| Hedefe ulaşma | **%101** |
+| ScyllaDB batch yazma p50 / p95 / p99 | 18,4 / 38,7 / **48,4 ms** |
+| Producer hata oranı | **0** |
+| DLQ oranı | **0** |
+
+Test ortamı: Docker'a ayrılmış 12 çekirdek / 7,6 GB · Kafka tek broker (KRaft, 12 partition) ·
+ScyllaDB tek node RF=1 (4 shard / 2,5 GB) · 1 consumer replikası. Ölçüm sırasında anomali
+demo modu kapalıdır (yapay tıkanıklık bölgesel hız metriklerini bozar).
+
+**Consumer geride kalmıyor.** Lag'i 10 saniye aralıklarla örnekledim:
+16.500 → 48.000 → 32.000 → 29.500 → **0** → 48.000 mesaj. Bu testere dişi deseni batch'leme
+kaynaklı: consumer 2000'lik grupları biriktirip boşaltıyor. Kritik olan **lag'in düzenli
+olarak 0'a inmesi** — sistem yetişemiyor olsaydı lag hiç sıfırlanmaz, monoton büyürdü.
+Tepe değeri 48.000 mesaj, 50k/sn hızda yaklaşık 1 saniyelik uçuş halindeki veriye denk geliyor.
+
+Günlük geliştirmede `docker-compose.yml` bilerek hafif bir profille (5.000 msg/sn) gelir ki
+bir laptop'ı boğmasın. Hedef hız `deploy/docker-compose.bench.yml` override'ıyla açılır:
+
+```bash
+docker compose -f docker-compose.yml -f deploy/docker-compose.bench.yml up -d --build
+./scripts/benchmark.sh 180
+```
 
 ### Faz 4 — Monitoring (Prometheus + Grafana) ✅
 - Her iki Go servisi de `/metrics` endpoint'i expose eder (producer: 2112, consumer: 2113)
@@ -203,8 +232,8 @@ docker compose logs -f producer consumer
 # 2. Zero-loss kanıtı
 ./scripts/verify-zero-loss.sh 60
 
-# 3. Performans ölçümü
-./scripts/benchmark.sh 300
+# 3. Performans ölçümü (hedef hıza çıkarır, ~4 dk sürer)
+./scripts/benchmark.sh 180
 
 # 4. Dayanıklılık testi
 ./scripts/chaos-test.sh
