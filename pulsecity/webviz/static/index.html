@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PulseCity — Canlı Trafik Haritası</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: rgba(20, 27, 35, 0.92);
+    --border: #2a3542;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #4da3ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  #map { position: absolute; inset: 0; background: var(--bg); }
+
+  .panel {
+    position: absolute; z-index: 1000;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 4px 20px rgba(0,0,0,.45);
+  }
+  #stats { top: 12px; left: 12px; min-width: 210px; }
+  #stats h1 { margin: 0 0 2px; font-size: 15px; letter-spacing: .3px; }
+  #stats .sub { color: var(--muted); font-size: 11px; margin-bottom: 10px; }
+  .row { display: flex; justify-content: space-between; gap: 16px; padding: 2px 0; }
+  .row span:last-child { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .status { display: flex; align-items: center; gap: 6px; margin-top: 10px;
+    padding-top: 8px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #f85149; }
+  .dot.on { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+
+  #legend { bottom: 12px; right: 12px; font-size: 12px; }
+  #legend .item { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+  .swatch { width: 14px; height: 14px; border-radius: 3px; flex: none; }
+
+  #alerts { top: 12px; right: 12px; width: 260px; max-height: 45vh; overflow-y: auto; }
+  #alerts h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .8px; color: var(--muted); }
+  .alert { display: flex; justify-content: space-between; gap: 8px;
+    padding: 6px 8px; border-radius: 6px; background: rgba(248,81,73,.13);
+    border-left: 3px solid #f85149; margin-bottom: 6px; font-size: 12px; }
+  .alert small { color: var(--muted); display: block; }
+  .quiet { color: var(--muted); font-size: 12px; font-style: italic; }
+
+  @keyframes pulse { 0%,100% { opacity:.75 } 50% { opacity:.25 } }
+  .anomaly-ring { animation: pulse 1.1s ease-in-out infinite; }
+
+  .leaflet-container { background: var(--bg); }
+  .zone-label { background: none; border: none; box-shadow: none;
+    color: #cfd9e3; font-size: 10px; text-align: center; line-height: 1.35;
+    text-shadow: 0 0 4px #000, 0 0 8px #000; white-space: nowrap; }
+  .zone-label .zone-name { font-size: 13px; font-weight: 700; color: #fff;
+    letter-spacing: .2px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="stats" class="panel">
+  <h1>PulseCity</h1>
+  <div class="sub">İstanbul · canlı trafik yoğunluğu</div>
+  <div class="row"><span>Akış</span><span><b id="mps">0</b> msg/sn</span></div>
+  <div class="row"><span>Takip edilen araç</span><span id="veh">0</span></div>
+  <div class="row"><span>Haritada</span><span id="shown">0</span></div>
+  <div class="row"><span>Bağlı izleyici</span><span id="cli">0</span></div>
+  <div class="status"><span class="dot" id="conn-dot"></span><span id="conn-txt">bağlanıyor…</span></div>
+</div>
+
+<div id="alerts" class="panel">
+  <h2>Anomali (Faz 8)</h2>
+  <div id="alert-list"><div class="quiet">Tüm bölgeler normal.</div></div>
+</div>
+
+<div id="legend" class="panel">
+  <div class="item"><span class="swatch" style="background:#3fb950"></span>Akıcı</div>
+  <div class="item"><span class="swatch" style="background:#d29922"></span>Yoğun</div>
+  <div class="item"><span class="swatch" style="background:#db6d28"></span>Çok yoğun</div>
+  <div class="item"><span class="swatch" style="background:#f85149"></span>Anomali — normalin %40 altı</div>
+</div>
+
+<script>
+const map = L.map('map', { preferCanvas: true, zoomControl: true })
+  .setView([41.02, 29.01], 12);
+
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OpenStreetMap &copy; CARTO',
+  maxZoom: 19
+}).addTo(map);
+
+// Araç noktaları canvas üzerinde çizilir - 1500 nokta için SVG çok yavaş kalır.
+const vehicleLayer = L.canvas({ padding: 0.3 });
+const zoneLayer = L.layerGroup().addTo(map);
+
+let vehicleMarkers = [];
+const zoneShapes = new Map();   // zoneId -> { circle, label }
+let fitted = false;
+
+// Bölge kimlikleri ASCII (Kafka anahtarı + ScyllaDB partition key olarak
+// kullanılıyorlar). Görüntülenecek düzgün Türkçe adlar burada eşlenir.
+const DISTRICT_NAMES = {
+  'istanbul-esenyurt':      'Esenyurt',
+  'istanbul-kucukcekmece':  'Küçükçekmece',
+  'istanbul-bagcilar':      'Bağcılar',
+  'istanbul-bahcelievler':  'Bahçelievler',
+  'istanbul-sultangazi':    'Sultangazi',
+  'istanbul-uskudar':       'Üsküdar',
+  'istanbul-umraniye':      'Ümraniye',
+  'istanbul-maltepe':       'Maltepe',
+  'istanbul-pendik':        'Pendik',
+};
+
+// Eşleme yoksa kimliği okunabilir hale getir - yeni bir bölge eklendiğinde
+// harita bozulmaz, sadece ham adı gösterir.
+function districtName(id) {
+  return DISTRICT_NAMES[id] || id.replace(/^istanbul-/, '').replace(/-/g, ' ');
+}
+
+// Bölge rengi: önce anomali, sonra ortalama hız. Düşük hız = tıkanıklık.
+function zoneColor(z) {
+  if (z.anomaly) return '#f85149';
+  if (z.avg_speed < 25) return '#db6d28';
+  if (z.avg_speed < 40) return '#d29922';
+  return '#3fb950';
+}
+
+function speedColor(s) {
+  if (s < 15) return '#f85149';
+  if (s < 30) return '#d29922';
+  if (s < 50) return '#58a6ff';
+  return '#3fb950';
+}
+
+function renderZones(zones) {
+  const bounds = [];
+  for (const z of zones) {
+    if (!z.lat && !z.lng) continue;
+    bounds.push([z.lat, z.lng]);
+    const color = zoneColor(z);
+    // Yarıçap da veriden gelir (webviz onu ping dağılımından türetir), böylece
+    // producer'daki bölge yarıçapı değişince harita kendiliğinden uyar.
+    const radius = z.radius || 2000;
+    let entry = zoneShapes.get(z.id);
+
+    if (!entry) {
+      const circle = L.circle([z.lat, z.lng], {
+        radius, color, fillColor: color,
+        fillOpacity: 0.18, weight: 2
+      }).addTo(zoneLayer);
+      const label = L.marker([z.lat, z.lng], {
+        icon: L.divIcon({ className: 'zone-label', html: '', iconSize: [140, 30] }),
+        interactive: false
+      }).addTo(zoneLayer);
+      entry = { circle, label };
+      zoneShapes.set(z.id, entry);
+    }
+
+    entry.circle.setLatLng([z.lat, z.lng]);
+    entry.circle.setRadius(radius);
+    entry.circle.setStyle({ color, fillColor: color, fillOpacity: z.anomaly ? 0.34 : 0.18 });
+    if (entry.circle._path) {
+      entry.circle._path.classList.toggle('anomaly-ring', !!z.anomaly);
+    }
+
+    const name = districtName(z.id);
+    entry.label.setLatLng([z.lat, z.lng]);
+    entry.label.getElement().innerHTML =
+      `<span class="zone-name">${name}</span><br>${z.avg_speed.toFixed(0)} km/h · ${z.pings}/sn`;
+
+    entry.circle.bindTooltip(
+      `<b>${name}</b><br>` +
+      `Yoğunluk: ${z.pings} ping/sn<br>` +
+      `Ortalama hız: ${z.avg_speed.toFixed(1)} km/h<br>` +
+      `Öğrenilen normal: ${z.baseline ? z.baseline.toFixed(1) + ' km/h' : '—'}` +
+      (z.anomaly ? '<br><b style="color:#f85149">ANOMALİ</b>' : ''),
+      { sticky: true }
+    );
+  }
+
+  if (!fitted && bounds.length) {
+    map.fitBounds(bounds, { padding: [70, 70] });
+    fitted = true;
+  }
+}
+
+function renderVehicles(list) {
+  // Nokta sayısı sabit olduğu için marker'ları yeniden yaratmak yerine
+  // mevcutları taşımak çok daha ucuz.
+  for (let i = 0; i < list.length; i++) {
+    const [lat, lng, speed] = list[i];
+    if (i < vehicleMarkers.length) {
+      const m = vehicleMarkers[i];
+      m.setLatLng([lat, lng]);
+      m.setStyle({ fillColor: speedColor(speed) });
+    } else {
+      vehicleMarkers.push(
+        L.circleMarker([lat, lng], {
+          renderer: vehicleLayer, radius: 2.5, weight: 0,
+          fillColor: speedColor(speed), fillOpacity: 0.85
+        }).addTo(map)
+      );
+    }
+  }
+  // Fazlalık marker'ları kaldır (araç sayısı azaldıysa)
+  for (let i = list.length; i < vehicleMarkers.length; i++) {
+    map.removeLayer(vehicleMarkers[i]);
+  }
+  vehicleMarkers.length = list.length;
+}
+
+function renderAlerts(zones) {
+  const bad = zones.filter(z => z.anomaly);
+  const el = document.getElementById('alert-list');
+  if (!bad.length) {
+    el.innerHTML = '<div class="quiet">Tüm bölgeler normal.</div>';
+    return;
+  }
+  el.innerHTML = bad.map(z => `
+    <div class="alert">
+      <div>
+        <b>${districtName(z.id)}</b>
+        <small>normal ${z.baseline.toFixed(0)} km/h</small>
+      </div>
+      <div style="text-align:right">
+        <b>${z.avg_speed.toFixed(0)}</b>
+        <small>km/h</small>
+      </div>
+    </div>`).join('');
+}
+
+function setStatus(ok, text) {
+  document.getElementById('conn-dot').classList.toggle('on', ok);
+  document.getElementById('conn-txt').textContent = text;
+}
+
+// --- WebSocket, üstel geri çekilmeli yeniden bağlanma ---
+let ws, retry = 0;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => { retry = 0; setStatus(true, 'canlı'); };
+
+  ws.onmessage = (ev) => {
+    const snap = JSON.parse(ev.data);
+    renderZones(snap.zones || []);
+    renderVehicles(snap.vehicles || []);
+    renderAlerts(snap.zones || []);
+    document.getElementById('mps').textContent = snap.stats.msg_per_sec.toLocaleString('tr-TR');
+    document.getElementById('veh').textContent = snap.stats.vehicles.toLocaleString('tr-TR');
+    document.getElementById('shown').textContent = snap.stats.shown.toLocaleString('tr-TR');
+    document.getElementById('cli').textContent = snap.stats.clients;
+  };
+
+  ws.onclose = () => {
+    const wait = Math.min(1000 * Math.pow(2, retry++), 15000);
+    setStatus(false, `bağlantı koptu, ${Math.round(wait / 1000)}sn sonra yeniden…`);
+    setTimeout(connect, wait);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+connect();
+</script>
+</body>
+</html>

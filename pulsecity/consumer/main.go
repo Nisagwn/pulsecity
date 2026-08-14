@@ -54,7 +54,118 @@ var (
 		Name: "pulsecity_vehicle_avg_speed_kmh",
 		Help: "Bolgeye gore son batch'teki ortalama hiz (km/h)",
 	}, []string{"zone_id"})
+	// Faz 8: anomali tespiti
+	metricZoneAnomaly = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pulsecity_zone_anomaly_detected",
+		Help: "Bolgede anomali (olasi tikaniklik/kaza) tespit edildi mi: 1 = evet, 0 = hayir",
+	}, []string{"zone_id"})
+	metricZoneBaseline = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "pulsecity_zone_speed_baseline_kmh",
+		Help: "Bolge icin ogrenilen normal hiz baseline'i (EMA, km/h)",
+	}, []string{"zone_id"})
 )
+
+// --- Faz 8: Anomali tespiti --------------------------------------------------
+//
+// Sistemi "veri tasiyan"dan "veriden anlam cikaran"a tasiyan katman. Her bolge
+// icin normal hizin ne oldugunu EMA (ustel hareketli ortalama) ile OGRENIR ve
+// bu normalden ciddi bir sapmayi anomali olarak isaretler.
+//
+// Not: zone_id hem Kafka partition key'i hem de ScyllaDB partition key'i
+// oldugu icin bir bolgenin TUM mesajlari tek bir consumer replikasina duser.
+// Bu sayede `docker compose up -d --scale consumer=3` yapildiginda baseline
+// replikalara bolunmez, tutarli kalir - mevcut partition tasariminin bedava
+// getirdigi bir ozellik.
+
+const (
+	// Isinma penceresi: baseline guvenilir hale gelene kadar anomali aranmaz.
+	baselineWarmupBatches = 20
+	// Normalin bu oranda altina dusen ortalama hiz anomali sayilir.
+	anomalyDropRatio = 0.40
+	// EMA agirligi: dusuk deger = baseline yavas ve istikrarli degisir.
+	baselineAlpha = 0.05
+)
+
+type zoneBaseline struct {
+	ema        float64
+	samples    int
+	wasAnomaly bool
+}
+
+// evaluate, bolgenin guncel ortalama hizini isler, baseline'i gunceller ve
+// anomali olup olmadigini dondurur.
+//
+// Metriklerden ve loglamadan bagimsiz tutuldu ki dogrudan test edilebilsin.
+func (b *zoneBaseline) evaluate(current float64) bool {
+	b.samples++
+
+	if b.samples <= baselineWarmupBatches {
+		// Isinma: basit hareketli ortalama ile hizli yakinsama. Bu olmadan
+		// baseline 0'dan baslar ve ilk batch'ler her zaman anomali gorunur.
+		b.ema += (current - b.ema) / float64(b.samples)
+		return false
+	}
+
+	if current < b.ema*(1-anomalyDropRatio) {
+		// KRITIK TASARIM KARARI: anomali sirasinda baseline GUNCELLENMEZ.
+		// Aksi halde uzun suren bir sikisiklik yavas yavas "yeni normal"
+		// haline gelir, EMA ona yakinsar ve anomali bir daha asla tespit
+		// edilemez - tespit sistemi kendi kendini kor eder.
+		return true
+	}
+
+	b.ema = baselineAlpha*current + (1-baselineAlpha)*b.ema
+	return false
+}
+
+var (
+	baselineMu sync.Mutex
+	baselines  = map[string]*zoneBaseline{}
+)
+
+// updateZoneAnalytics, basariyla yazilan bir zone grubunun domain metriklerini
+// gunceller: yogunluk, ortalama hiz ve anomali durumu.
+func updateZoneAnalytics(zoneID string, pings []VehiclePing) {
+	metricPingsByZone.WithLabelValues(zoneID).Add(float64(len(pings)))
+
+	var speedSum float64
+	for _, p := range pings {
+		speedSum += p.SpeedKmh
+	}
+	current := speedSum / float64(len(pings))
+	metricAvgSpeedByZone.WithLabelValues(zoneID).Set(current)
+
+	baselineMu.Lock()
+	b, ok := baselines[zoneID]
+	if !ok {
+		b = &zoneBaseline{}
+		baselines[zoneID] = b
+	}
+	anomaly := b.evaluate(current)
+	baseline := b.ema
+	changed := anomaly != b.wasAnomaly
+	b.wasAnomaly = anomaly
+	baselineMu.Unlock()
+
+	metricZoneBaseline.WithLabelValues(zoneID).Set(baseline)
+	if anomaly {
+		metricZoneAnomaly.WithLabelValues(zoneID).Set(1)
+	} else {
+		metricZoneAnomaly.WithLabelValues(zoneID).Set(0)
+	}
+
+	// Her batch'te degil, sadece durum degistiginde logla - yoksa saniyede
+	// onlarca satir akar.
+	if changed {
+		if anomaly {
+			log.Printf("[consumer] ANOMALI: %s bolgesinde hiz %.1f km/h, ogrenilen normal %.1f km/h (%%%.0f dusus)",
+				zoneID, current, baseline, (1-current/baseline)*100)
+		} else {
+			log.Printf("[consumer] %s bolgesi normale dondu: %.1f km/h (baseline %.1f km/h)",
+				zoneID, current, baseline)
+		}
+	}
+}
 
 func startMetricsServer(addr string) {
 	mux := http.NewServeMux()
@@ -244,13 +355,8 @@ func writeBatchToScylla(session *gocql.Session, dlqWriter *kafka.Writer, ctx con
 				return
 			}
 
-			// Basarili yazim -> bolge bazli domain metriklerini guncelle
-			metricPingsByZone.WithLabelValues(zoneID).Add(float64(len(pings)))
-			var speedSum float64
-			for _, p := range pings {
-				speedSum += p.SpeedKmh
-			}
-			metricAvgSpeedByZone.WithLabelValues(zoneID).Set(speedSum / float64(len(pings)))
+			// Basarili yazim -> bolge bazli domain metrikleri + Faz 8 anomali analizi
+			updateZoneAnalytics(zoneID, pings)
 		}(zoneID, pings)
 	}
 	wg.Wait()
