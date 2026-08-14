@@ -1,0 +1,88 @@
+# PulseCity — Production Compose Override (Faz 6)
+#
+# Kullanım (VPS üzerinde, proje kök dizininden):
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d --build
+#
+# Bu dosya, local docker-compose.yml'in ÜZERİNE gelen bir override'dır:
+# - Kaynak limitleri ekler (paylaşımlı/ucuz VPS'te sistemin boğulmasını önlemek için)
+# - restart policy ekler (VPS reboot sonrası otomatik ayağa kalkma)
+# - Grafana/Prometheus portlarını sadece Nginx üzerinden dışa açacak şekilde kısıtlar
+#   (doğrudan internete açık bırakmak yerine reverse proxy arkasına alır)
+# - Ortam değişkenlerini .env dosyasından okur (bkz. .env.example)
+
+version: "3.8"
+
+services:
+  kafka:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1.5G
+
+  scylla:
+    restart: unless-stopped
+    command: --smp 2 --memory 2000M --overprovisioned 1 --api-address 0.0.0.0
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2.5G
+
+  producer:
+    restart: unless-stopped
+    ports: []   # local'de disariya acilan 2112 portu, prod'da kapali - Prometheus internal network'ten erisir
+    environment:
+      TARGET_RATE_PER_SEC: "${TARGET_RATE_PER_SEC:-50000}"
+      VEHICLE_COUNT: "${VEHICLE_COUNT:-20000}"
+      PRODUCER_WORKERS: "${PRODUCER_WORKERS:-4}"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  consumer:
+    restart: unless-stopped
+    deploy:
+      replicas: 3          # Faz 3'teki paralel consumer stratejisi production'da kalıcı
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  prometheus:
+    restart: unless-stopped
+    ports: []   # doğrudan dışa kapalı, Nginx reverse proxy üzerinden erişilir (istenirse)
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  grafana:
+    restart: unless-stopped
+    ports: []   # doğrudan dışa kapalı, Nginx reverse proxy (deploy/nginx.conf) üzerinden erişilir
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SERVER_ROOT_URL: "${GRAFANA_ROOT_URL:-http://localhost/}"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: pulsecity-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - grafana

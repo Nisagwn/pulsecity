@@ -1,0 +1,97 @@
+{
+  "title": "PulseCity - Canlı Trafik Boru Hattı",
+  "uid": "pulsecity-main",
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Throughput (üretilen / işlenen msg/sn)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(pulsecity_producer_messages_total[30s])",
+          "legendFormat": "üretilen (producer)"
+        },
+        {
+          "expr": "rate(pulsecity_consumer_messages_processed_total[30s])",
+          "legendFormat": "işlenen (consumer)"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Hata / DLQ oranı (msg/sn)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(pulsecity_producer_errors_total[30s])",
+          "legendFormat": "producer hataları"
+        },
+        {
+          "expr": "rate(pulsecity_consumer_dlq_total[30s])",
+          "legendFormat": "DLQ'ya yönlendirilen"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Bölge bazlı araç yoğunluğu (ping/sn)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "rate(pulsecity_vehicle_pings_by_zone_total[30s])",
+          "legendFormat": "{{zone_id}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Bölge bazlı ortalama hız (km/h)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "pulsecity_vehicle_avg_speed_kmh",
+          "legendFormat": "{{zone_id}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "ScyllaDB batch yazma süresi (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(pulsecity_consumer_batch_write_seconds_bucket[1m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(pulsecity_consumer_batch_write_seconds_bucket[1m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(pulsecity_consumer_batch_write_seconds_bucket[1m]))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Toplam işlenen mesaj (kümülatif)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "pulsecity_consumer_messages_processed_total",
+          "legendFormat": "toplam işlenen"
+        }
+      ]
+    }
+  ]
+}

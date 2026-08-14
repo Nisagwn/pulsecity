@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "pulsecity-producer"
+    static_configs:
+      - targets: ["producer:2112"]
+
+  - job_name: "pulsecity-consumer"
+    static_configs:
+      # Faz 3'te consumer birden fazla replica ile calisirsa (docker compose
+      # --scale consumer=3), Prometheus'un hepsini gormesi icin bu satir
+      # yerine bir service-discovery mekanizmasi (ör. dns_sd_configs) gerekir.
+      # Faz 4 MVP'sinde tek consumer'i hedefliyoruz.
+      - targets: ["consumer:2113"]
