@@ -1,0 +1,27 @@
+# PulseCity — Benchmark override (Faz 3)
+#
+# Kullanım:
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.bench.yml up -d --build
+#   ./scripts/benchmark.sh 300
+#
+# docker-compose.yml varsayılan olarak hafif bir profille (5000 msg/sn) gelir;
+# günlük geliştirmede bir laptop'ı boğmasın diye. Projenin asıl hedefi olan
+# 50.000 msg/sn'yi ölçmek için bu override kullanılır.
+#
+# ÖNEMLİ: Ölçüm öncesi makinede yeterli boş RAM olmalı. Aksi halde ölçülen şey
+# boru hattının kapasitesi değil, işletim sisteminin bellek baskısı olur.
+
+services:
+  producer:
+    environment:
+      TARGET_RATE_PER_SEC: "50000"
+      VEHICLE_COUNT: "20000"
+      PRODUCER_WORKERS: "8"
+      # Yapay tıkanıklık bölgesel hız metriklerini bozar ve benchmark
+      # sonucunu yanıltır - ölçüm sırasında mutlaka kapalı.
+      TEST_ANOMALY_DEMO: "false"
+
+  # Hedef hızda ScyllaDB darboğaz adayı: varsayılan 2 shard / 1.5 GB ile
+  # 50k yazma/sn zorlanır. Benchmark için shard ve bellek artırılır.
+  scylla:
+    command: --smp 4 --memory 2500M --overprovisioned 1 --api-address 0.0.0.0
