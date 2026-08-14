@@ -92,6 +92,81 @@
           "legendFormat": "toplam işlenen"
         }
       ]
+    },
+    {
+      "id": 7,
+      "title": "Bölge bazlı anomali durumu",
+      "description": "1 = bölgenin ortalama hızı öğrenilen normalin %40'ından fazla altına düştü (olası tıkanıklık/kaza).",
+      "type": "state-timeline",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "normal", "color": "green", "index": 0 },
+                "1": { "text": "ANOMALİ", "color": "red", "index": 1 }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }
+      },
+      "targets": [
+        {
+          "expr": "pulsecity_zone_anomaly_detected",
+          "legendFormat": "{{zone_id}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Mevcut hız vs öğrenilen baseline (km/h)",
+      "description": "Kesintisiz çizgiler o anki ortalama hız, baseline ise EMA ile öğrenilen normal. Baseline anomali sırasında bilerek güncellenmez — yoksa uzun süreli tıkanıklık 'yeni normal' olur.",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 30 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "velocitykmh",
+          "custom": { "lineWidth": 1, "fillOpacity": 0 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*baseline.*" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "expr": "pulsecity_vehicle_avg_speed_kmh",
+          "legendFormat": "{{zone_id}} mevcut"
+        },
+        {
+          "expr": "pulsecity_zone_speed_baseline_kmh",
+          "legendFormat": "{{zone_id}} baseline"
+        }
+      ]
     }
   ]
 }

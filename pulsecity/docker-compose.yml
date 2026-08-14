@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # --- Kafka (KRaft mode, Zookeeper'sız tek broker - local gelistirme icin yeterli) ---
   kafka:
@@ -18,7 +16,10 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      CLUSTER_ID: "pulsecity-cluster-01"
+      # KRaft, cluster id olarak base64 kodlanmis 16 baytlik bir UUID bekler
+      # (22 karakter). Duz metin bir isim ("pulsecity-cluster-01") broker'i
+      # baslangicta hata verdirir.
+      CLUSTER_ID: "LNB2LvLaGdpmMN_DZcRCDg"
       KAFKA_NUM_NETWORK_THREADS: 8
       KAFKA_NUM_IO_THREADS: 8
       KAFKA_NUM_PARTITIONS: 12
@@ -64,7 +65,12 @@ services:
     volumes:
       - ./scylla-init:/scylla-init
     entrypoint: ["/bin/sh", "-c"]
-    command: "cqlsh scylla -f /scylla-init/schema.cql"
+    # DIKKAT: `sh -c` sadece ILK argumani script olarak calistirir, geri kalanlar
+    # $0/$1... olur. Bu yuzden komutun tamami TEK bir liste elemani olmali -
+    # duz string yazilirsa compose kelimelere boler ve container'da yalnizca
+    # `cqlsh` calisir (host argumani kaybolur, 127.0.0.1'e baglanmayi dener).
+    command:
+      - "cqlsh scylla -f /scylla-init/schema.cql"
 
   # --- Go Producer (Load Generator) ---
   producer:
@@ -79,10 +85,17 @@ services:
     environment:
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_TOPIC: "vehicle-pings"
-      TARGET_RATE_PER_SEC: "50000"
-      VEHICLE_COUNT: "20000"
-      PRODUCER_WORKERS: "8"
+      # Local laptop icin hafifletilmis profil.
+      # Faz 3 benchmark'i icin orijinal degerlere don: 50000 / 20000 / 8
+      TARGET_RATE_PER_SEC: "5000"
+      VEHICLE_COUNT: "2000"
+      PRODUCER_WORKERS: "4"
       METRICS_ADDR: ":2112"
+      # Faz 8: periyodik olarak bir bolgeyi yapay olarak tikar, boylece
+      # anomali tespitinin calistigi haritada/Grafana'da canli gorulebilir.
+      # Bolgesel hiz verisini bilerek bozdugu icin prod'da ve benchmark
+      # olcumlerinde KAPALI olmali (bkz. deploy/docker-compose.prod.yml).
+      TEST_ANOMALY_DEMO: "true"
 
   # --- Go Consumer ---
   # Birden fazla instance ile paralel tuketim icin:
@@ -103,6 +116,27 @@ services:
       SCYLLA_HOSTS: "scylla:9042"
       CONSUMER_BATCH_SIZE: "2000"
       METRICS_ADDR: ":2113"
+
+  # --- Faz 9: Canli harita (WebSocket + Leaflet) ---
+  # Kendi consumer group'unda calisir (pulsecity-webviz): ana consumer'in
+  # offset'lerine dokunmaz, ondan mesaj calmaz. Zero-loss yolu etkilenmez.
+  webviz:
+    build:
+      context: ./webviz
+    container_name: pulsecity-webviz
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "vehicle-pings"
+      KAFKA_GROUP_ID: "pulsecity-webviz"
+      PROM_URL: "http://prometheus:9090"
+      LISTEN_ADDR: ":8080"
+      BROADCAST_INTERVAL_MS: "1000"
+      MAX_VEHICLES_ON_MAP: "1500"
 
   prometheus:
     image: prom/prometheus:v2.53.0

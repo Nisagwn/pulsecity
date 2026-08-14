@@ -10,8 +10,6 @@
 #   (doğrudan internete açık bırakmak yerine reverse proxy arkasına alır)
 # - Ortam değişkenlerini .env dosyasından okur (bkz. .env.example)
 
-version: "3.8"
-
 services:
   kafka:
     restart: unless-stopped
@@ -37,6 +35,9 @@ services:
       TARGET_RATE_PER_SEC: "${TARGET_RATE_PER_SEC:-50000}"
       VEHICLE_COUNT: "${VEHICLE_COUNT:-20000}"
       PRODUCER_WORKERS: "${PRODUCER_WORKERS:-4}"
+      # Faz 8 demo modu prod'da KAPALI: yapay tikaniklik bolgesel hiz
+      # metriklerini ve benchmark sonuclarini kirletir.
+      TEST_ANOMALY_DEMO: "false"
     deploy:
       resources:
         limits:
@@ -61,6 +62,15 @@ services:
           cpus: "0.5"
           memory: 512M
 
+  webviz:
+    restart: unless-stopped
+    ports: []   # doğrudan dışa kapalı, Nginx reverse proxy üzerinden "/" olarak servis edilir
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
   grafana:
     restart: unless-stopped
     ports: []   # doğrudan dışa kapalı, Nginx reverse proxy (deploy/nginx.conf) üzerinden erişilir
@@ -69,7 +79,9 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
-      GF_SERVER_ROOT_URL: "${GRAFANA_ROOT_URL:-http://localhost/}"
+      # Faz 9'dan sonra kök adres haritaya ayrıldı, Grafana alt yola taşındı.
+      GF_SERVER_ROOT_URL: "${GRAFANA_ROOT_URL:-http://localhost/grafana/}"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
     deploy:
       resources:
         limits:
@@ -86,3 +98,4 @@ services:
       - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - grafana
+      - webviz

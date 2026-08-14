@@ -1,0 +1,24 @@
+# Ortam dosyaları — .env ASLA commit edilmemeli (şablon: pulsecity/.env.example)
+.env
+*.env
+!*.env.example
+
+# Script çıktıları (her çalıştırmada yeniden üretilir)
+benchmark-results.md
+chaos-test-results.md
+
+# Go derleme artıkları
+*.exe
+*.test
+*.out
+coverage.txt
+
+# Loglar
+*.log
+
+# Editör / işletim sistemi
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

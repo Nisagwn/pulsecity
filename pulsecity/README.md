@@ -29,6 +29,7 @@ izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
 |---|---|
 | Kafka partition key = `zone_id` | Aynı bölgenin ping'leri aynı partition'a gider → bölge içi sıralama korunur |
 | ScyllaDB partition key = `zone_id` | Bölge bazlı sorguları hızlandırır, tek bir global sayaç yerine 9 bölgeye dağıtarak hot-partition riskini azaltır |
+| Bölge = tek bir gerçek ilçe (1:1) | Başlangıçta 3 ilçe × 3 alt bölge vardı (`kadikoy-1/2/3` gibi); haritada aynı ilçe adını taşıyan üç çember yayılınca en dıştaki komşu ilçenin üzerindeymiş gibi görünüyor ve yanlış ilçe adı okunuyordu. İstanbul'un en kalabalık 9 ilçesine bire bir eşleme bu belirsizliği kaldırdı — `TestZoneCirclesDoNotOverlap` çakışmayı kilitler |
 | Manuel Kafka offset commit | Auto-commit ile "işlemeden önce commit" riski var — zero-loss için önce ScyllaDB'ye yaz, sonra commit et |
 | UnloggedBatch (zone bazlı), LoggedBatch değil | ScyllaDB'de çoklu-partition LoggedBatch pahalı bir batchlog mekanizması kullanır; aynı partition içi UnloggedBatch + paralel goroutine çok daha performanslı |
 | DLQ (dead-letter queue) | Hiçbir mesaj sessizce kaybolmasın — parse/yazma hatası olan her mesaj DLQ'ya yönlendirilir |
@@ -36,14 +37,16 @@ izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
 ## Klasör yapısı
 
 ```
+.github/workflows/       # CI/CD (lint, test, uçtan uca test, imaj yayınlama)
 pulsecity/
-├── docker-compose.yml       # Kafka, ScyllaDB, producer, consumer, Prometheus, Grafana
+├── docker-compose.yml       # Kafka, ScyllaDB, producer, consumer, webviz, Prometheus, Grafana
 ├── producer/                # Go load generator (sanal araç GPS ping üreteci)
-├── consumer/                # Go consumer (Kafka -> ScyllaDB, DLQ yönlendirme)
+├── consumer/                # Go consumer (Kafka -> ScyllaDB, DLQ, anomali tespiti)
+├── webviz/                  # Go WebSocket servisi + Leaflet canlı harita (Faz 9)
 ├── scylla-init/schema.cql   # ScyllaDB şema tanımı
 ├── monitoring/               # Prometheus config + Grafana provisioning/dashboard
 ├── scripts/                  # zero-loss testi, benchmark, chaos testing scriptleri
-└── deploy/                   # Production compose override, Nginx, VPS deployment rehberi
+└── deploy/                   # Production/CI compose override, Nginx, VPS deployment rehberi
 ```
 
 ## Hızlı başlangıç (local)
@@ -54,6 +57,8 @@ docker compose up -d --build
 
 Servisler ayağa kalktıktan (~30sn) sonra:
 
+- **Canlı harita**: http://localhost:8080 — bölgeler yoğunluğa göre renklenir,
+  araçlar nokta olarak akar, anomali tespit edilen bölge kırmızı yanıp söner
 - **Grafana**: http://localhost:3000 (admin / pulsecity) — canlı dashboard
 - **Prometheus**: http://localhost:9090 — ham metrikler
 - ScyllaDB'de veri doğrulama: `docker exec -it pulsecity-scylla cqlsh -e "SELECT * FROM pulsecity.vehicle_pings LIMIT 10;"`
@@ -73,8 +78,18 @@ Uçtan uca happy-path: producer → Kafka → consumer → ScyllaDB. `docker-com
 ### Faz 2 — Zero-Loss Garantisi ✅
 - Producer: `RequireAll` acks + retry-with-backoff (`writeWithRetry`)
 - Consumer: manuel offset commit, sadece ScyllaDB'ye yazdıktan/DLQ'ya yönlendirdikten SONRA commit
-- Doğrulama: `./scripts/verify-zero-loss.sh` — consumer'ı işlem ortasında kill eder,
-  gönderilen mesaj sayısı ile (ScyllaDB satırı + DLQ satırı) toplamının eşit olduğunu doğrular
+- Doğrulama: `./scripts/verify-zero-loss.sh` — consumer'ı işlem ortasında SIGKILL ile
+  öldürür, sonra Kafka'daki **tekil birincil anahtar** sayısı ile (ScyllaDB satırı + DLQ
+  mesajı) toplamının eşit olduğunu doğrular
+
+  Neden ham mesaj sayısıyla değil: tablonun birincil anahtarı
+  `(zone_id, ping_time, vehicle_id)` ve ScyllaDB'nin `timestamp` tipi milisaniye
+  hassasiyetinde. Aynı aracın aynı milisaniyeye düşen iki ping'i ikinci bir satır değil,
+  üzerine yazma üretir — ölçülen oran ~%7. Ham sayıyla karşılaştıran bir test, boru hattı
+  hiçbir şey kaybetmese bile başarısız görünür.
+
+  Ölçülen sonuç (30sn, 5000 msg/sn): 165.000 mesaj → 6.430'u aynı anahtara düştü →
+  beklenen 158.570 tekil satır; ScyllaDB'de tam olarak 158.570 satır, DLQ boş, kayıp yok.
 
 ### Faz 3 — Performans (50k/sn hedefi) ✅
 - Producer: 8 paralel worker goroutine, her biri kendi Kafka bağlantısı ve ayrık araç
@@ -103,14 +118,87 @@ Uçtan uca happy-path: producer → Kafka → consumer → ScyllaDB. `docker-com
 ### Faz 7 — Belgeleme ✅
 Bu README — mimari, tasarım kararları, kurulum, sonuçlar tek yerde.
 
+### Faz 8 — Anomali Tespiti ✅
+Sistemi "veri taşıyan" seviyesinden "veriden anlam çıkaran" seviyeye taşıyan katman.
+
+- Consumer, her bölge için **EMA ile öğrenilen bir "normal" hız baseline'ı** tutar
+- Bir bölgenin ortalama hızı baseline'ın **%40'ından fazla** altına düşerse anomali
+  (olası tıkanıklık/kaza) olarak işaretlenir; `pulsecity_zone_anomaly_detected` 1 olur
+- **Isınma penceresi**: ilk 20 batch'te sadece baseline beslenir, anomali aranmaz —
+  yoksa baseline 0'dan başlar ve ilk batch'ler her zaman anomali görünür
+- **Kritik tasarım kararı**: baseline yalnızca anomali OLMAYAN batch'lerde güncellenir.
+  Aksi halde uzun süren bir sıkışıklık yavaş yavaş "yeni normal" olur, EMA ona yakınsar
+  ve tespit sistemi kendi kendini kör eder. `TestBaselineFrozenDuringAnomaly` bunu kilitler.
+- `zone_id` hem Kafka hem ScyllaDB partition key'i olduğu için bir bölgenin tüm mesajları
+  tek bir consumer replikasına düşer — `--scale consumer=3` yapıldığında baseline bölünmez
+- **Demo modu**: producer'da `TEST_ANOMALY_DEMO=true` periyodik olarak rastgele bir bölgeyi
+  yapay olarak tıkar. Bölgesel hız verisini bilerek bozduğu için kodda varsayılan **kapalı**;
+  `docker-compose.yml` local'de açar, prod ve CI override'ları kapatır (yoksa `benchmark.sh`
+  ölçümü kirlenir)
+
+Ölçülen sonuç: producer `istanbul-sisli-1`'i tıkadıktan **1 saniye sonra** consumer yakaladı
+(8.0 km/h vs öğrenilen normal 37.6 km/h), tıkanıklık boyunca baseline 37.6'da sabit kaldı.
+
+### Faz 9 — Canlı Harita ✅
+Grafana'nın sayısal grafiklerinin yanına, trafiği gerçekten *görebildiğin* bir katman.
+
+- `webviz/`: Kafka'yı okuyup WebSocket üzerinden tarayıcıya yayın yapan Go servisi +
+  Leaflet tabanlı harita arayüzü (binary'ye `go:embed` ile gömülü)
+- **Ayrı servis, ayrı consumer group** (`pulsecity-webviz`): ana consumer zero-loss kritik
+  yolunda ve manuel offset commit ediyor; sunum katmanını oraya eklemek dayanıklılık
+  garantisine bağlardı. Ayrıca `--scale consumer=3` durumunda her replika akışın sadece bir
+  kısmını görür, harita eksik olurdu.
+- **Throttling kritik tasarım kararı**: saniyede 5000+ mesaj tarayıcıya iletilemez. Bellekte
+  "her aracın son konumu" tutulur ve saniyede bir tek snapshot yayınlanır — ağ yükü mesaj
+  hızından bağımsız hale gelir (ölçülen: 37 KB/snapshot, 1500 araç)
+- Haritada gösterilen araçlar ilk görüldüklerinde seçilir ve sabit kalır; her karede rastgele
+  örneklemek noktaların titremesine yol açardı
+- Bölge merkezleri ve çember yarıçapları producer'daki tablodan kopyalanmaz, gelen
+  ping'lerin dağılımından türetilir — şehir/bölge tanımı değiştiğinde burada elle
+  güncelleme gerekmez (ölçülen: producer'da 2000 m, haritada türetilen ~2020-2120 m)
+- Bölgeler İstanbul'un en kalabalık 9 ilçesi: Esenyurt, Küçükçekmece, Bağcılar,
+  Bahçelievler, Sultangazi (Avrupa) · Üsküdar, Ümraniye, Maltepe, Pendik (Anadolu).
+  Kimlikler ASCII (Kafka anahtarı + ScyllaDB partition key), Türkçe gösterim adları
+  arayüzde eşlenir
+- Anomali sinyali webviz'de yeniden hesaplanmaz, Faz 8'in Prometheus metriklerinden okunur;
+  mantık tek yerde kalsın diye
+
+**Ön koşul olarak düzeltilen hareket matematiği**: `step()` konum değişimini
+`speed * 0.00001` sabitiyle hesaplıyordu; bu araçların bildirdikleri hızın ~10 katıyla
+hareket etmesine yol açıyordu. Ayrıca boylam enleme göre ölçeklenmiyordu (41. paralelde
+1° boylam ~84 km, 1° enlem ~111 km) ve hiç sınır kontrolü yoktu — araçlar şehrin dışına
+çıkıyor ama `zone_id` etiketleri değişmediği için veri yalan söylüyordu. Üçü de düzeltildi;
+`TestStepMovesAtDeclaredSpeed` ve `TestVehicleStaysWithinItsZone` regresyonu kilitler.
+
+### Faz 10 — CI/CD ✅
+`.github/workflows/ci.yml` — her push ve PR'da çalışır:
+
+| Job | Ne yapar |
+|---|---|
+| `lint-build` | 3 modül için `gofmt` + `go vet` + derleme |
+| `test` | `go test -race -cover` (yarış dedektörü: üç servis de eşzamanlı kod içeriyor) |
+| `integration` | Düşük yükle tüm stack'i ayağa kaldırır; producer üretiyor mu, consumer işliyor mu, DLQ boş mu, ScyllaDB'ye yazılıyor mu, 9 bölge var mı, Faz 8 baseline üretiliyor mu, harita 200 dönüyor mu — hepsini doğrular, sonra temizler |
+| `docker-push` | Sadece `main`'e push'ta: 3 imajı GHCR'a yayınlar (ek secret gerekmez, `GITHUB_TOKEN` yeterli) |
+| `deploy` | **Pasif.** Elle tetikleme + `DEPLOY_ENABLED=true` repository variable olmadan çalışmaz |
+
+Ayrıca build altyapısı düzeltildi: `go.sum` dosyaları eklendi ve Dockerfile'lar
+`go mod tidy` yerine `go mod download` kullanacak şekilde yeniden yazıldı — build artık
+tekrarlanabilir ve bağımlılık katmanı önbelleğe alınabiliyor.
+
 ## Sonuçları doğrulama sırası
 
 Projeyi baştan sona kendi ortamında doğrulamak istersen:
 
 ```bash
+# 0. Birim testler (Go kurulu değilse Docker içinde de çalışır)
+cd producer && go test ./... -race && cd ..
+cd consumer && go test ./... -race && cd ..
+cd webviz   && go test ./... -race && cd ..
+
 # 1. Temel doğrulama
 docker compose up -d --build
 docker compose logs -f producer consumer
+# Canlı harita: http://localhost:8080
 
 # 2. Zero-loss kanıtı
 ./scripts/verify-zero-loss.sh 60
@@ -132,7 +220,13 @@ docker compose logs -f producer consumer
 - Karmaşık stream-processing (windowing, join, CEP) yok — ayrı bir proje fikri olarak değerlendirildi
 - TLS/HTTPS henüz yok (Faz 6'da not edildi, gerçek domain ile kolayca eklenebilir)
 - Kafka/ScyllaDB tek node (RF=1) — production-grade bir kurulumda RF=3 + multi-broker gerekir
+- `ping_time` milisaniye hassasiyetinde saklanır; aynı aracın aynı milisaniyedeki iki
+  ping'i tek satıra iner (~%7). Boru hattı bunları kaybetmez (Kafka'da ve DLQ hesabında
+  tam olarak dururlar), ancak ScyllaDB satır sayısı ham mesaj sayısından düşüktür. Her
+  ping'in ayrı satır olması gerekiyorsa birincil anahtara bir ayırt edici bileşen
+  (ör. ping sıra numarası) eklenmelidir.
 
 ## Teknoloji yığını
 
-Go · Apache Kafka (KRaft mode) · ScyllaDB · Prometheus · Grafana · Docker Compose · Nginx
+Go · Apache Kafka (KRaft mode) · ScyllaDB · Prometheus · Grafana · WebSocket (gorilla) ·
+Leaflet · Docker Compose · Nginx · GitHub Actions

@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -56,22 +57,34 @@ type VehiclePing struct {
 	ZoneID    string    `json:"zone_id"`
 }
 
-// Bursa merkezli basit bir bolge/grid tanimi.
-// Gercek bir sehri 3x3'luk 9 bolgeye ayiriyoruz (v1 icin yeterli granularite).
+// Istanbul'un en kalabalik 9 ilcesi. Her bolge = TEK bir gercek ilce.
+//
+// Onceki surumde 3 ilce x 3 alt bolge (kadikoy-1/2/3 gibi) kullaniliyordu;
+// haritada ayni ilce adini tasiyan uc ayri cember yan yana cikinca en distaki
+// komsu ilcenin uzerinde duruyormus gibi gorunuyor ve yanlis ilce adi
+// okunuyordu. Bire bir ilce eslemesi bu belirsizligi ortadan kaldirir.
+//
+// Bolge sayisi ScyllaDB'de partition dagilimini belirler; 9 bolge tek bir
+// global sayaca gore hot-partition riskini belirgin sekilde azaltir.
+//
+// Kimlikler bilerek ASCII: bu deger hem Kafka mesaj anahtari hem ScyllaDB
+// partition key'i. Turkce gosterim adlari arayuz tarafinda eslenir.
 var zones = []struct {
 	ID      string
 	LatBase float64
 	LngBase float64
 }{
-	{"bursa-osmangazi-1", 40.1950, 29.0500},
-	{"bursa-osmangazi-2", 40.1950, 29.0700},
-	{"bursa-nilufer-1", 40.2100, 29.0300},
-	{"bursa-nilufer-2", 40.2100, 29.0500},
-	{"bursa-yildirim-1", 40.1800, 29.0800},
-	{"bursa-yildirim-2", 40.1800, 29.1000},
-	{"bursa-osmangazi-3", 40.1750, 29.0500},
-	{"bursa-nilufer-3", 40.2050, 29.0100},
-	{"bursa-yildirim-3", 40.1900, 29.1100},
+	// Avrupa yakasi
+	{"istanbul-esenyurt", 41.0290, 28.6740},
+	{"istanbul-kucukcekmece", 41.0000, 28.7750},
+	{"istanbul-bagcilar", 41.0390, 28.8560},
+	{"istanbul-bahcelievler", 40.9980, 28.8590},
+	{"istanbul-sultangazi", 41.1060, 28.8720},
+	// Anadolu yakasi
+	{"istanbul-uskudar", 41.0230, 29.0150},
+	{"istanbul-umraniye", 41.0160, 29.1240},
+	{"istanbul-maltepe", 40.9350, 29.1310},
+	{"istanbul-pendik", 40.8770, 29.2330},
 }
 
 // vehicleState, her sanal aracin surekliligini (konum/hiz) tutar; boylece
@@ -89,18 +102,65 @@ type vehicleState struct {
 func newVehicle(id string, rng *rand.Rand) *vehicleState {
 	zi := rng.Intn(len(zones))
 	z := zones[zi]
+
+	// Arac, bolge dairesi icinde rastgele bir noktada dogar. sqrt(u) alan
+	// bazinda duzgun dagilim verir; dogrudan u kullanmak araclari merkeze
+	// yigar ve haritada ilcenin ortasinda kucuk bir kume gibi gorunurdu.
+	angle := rng.Float64() * 2 * math.Pi
+	dist := zoneRadiusMeters * math.Sqrt(rng.Float64())
+	dLat, dLng := metersToDegrees(math.Cos(angle)*dist, math.Sin(angle)*dist, z.LatBase)
+
 	return &vehicleState{
 		id:      id,
 		zoneIdx: zi,
-		lat:     z.LatBase + (rng.Float64()-0.5)*0.01,
-		lng:     z.LngBase + (rng.Float64()-0.5)*0.01,
+		lat:     z.LatBase + dLat,
+		lng:     z.LngBase + dLng,
 		speed:   10 + rng.Float64()*50,
 		heading: rng.Intn(360),
 	}
 }
 
-// step, araci bir sonraki ping icin hafifce hareket ettirir.
-func (v *vehicleState) step(rng *rand.Rand) {
+const (
+	// Bir derece enlem her yerde ~111.32 km. Boylam icin bu deger cos(enlem)
+	// ile daralir: Istanbul'un 41. paralelinde 1 derece boylam ~84 km.
+	metersPerDegreeLat = 111320.0
+
+	// Aracin kendi bolge merkezinden uzaklasabilecegi azami mesafe; haritadaki
+	// bolge cemberi de bu yaricapi temsil eder.
+	//
+	// Ilce olceginde anlamli gorunmesi icin 2 km secildi. En yakin iki merkez
+	// (Bagcilar - Bahcelievler) yaklasik 4.6 km arayla oldugu icin cemberler
+	// ust uste binmez - bolgeler haritada net ayrisir.
+	zoneRadiusMeters = 2000.0
+)
+
+// metersToDegrees, bir metre farkini enlem/boylam derecesine cevirir.
+// Boylam, verilen enlemdeki daralmaya gore olceklenir.
+func metersToDegrees(north, east, atLat float64) (dLat, dLng float64) {
+	dLat = north / metersPerDegreeLat
+	dLng = east / (metersPerDegreeLat * math.Cos(atLat*math.Pi/180))
+	return
+}
+
+// distanceMeters, iki nokta arasindaki yaklasik mesafe (duz duzlem yaklasimi -
+// birkac kilometrelik olceklerde hata ihmal edilebilir).
+func distanceMeters(lat1, lng1, lat2, lng2 float64) float64 {
+	dNorth := (lat1 - lat2) * metersPerDegreeLat
+	dEast := (lng1 - lng2) * metersPerDegreeLat * math.Cos(lat2*math.Pi/180)
+	return math.Hypot(dNorth, dEast)
+}
+
+// step, araci bir sonraki ping icin hareket ettirir ve o ping'de bildirilecek
+// efektif hizi dondurur.
+//
+// dt: ayni aracin iki ping'i arasinda gecen sure (saniye). Konum degisimi
+// dogrudan speed_kmh'den turetilir - yani alanin bildirdigi hiz ile haritada
+// gozlenen hiz birbirini tutar.
+//
+// speedFactor: normalde 1.0. Anomali demo modu bir bolgeyi yapay olarak
+// tikadiginda 1'den kucuk gelir; hem hareket hem bildirilen hiz ayni oranda
+// dustugu icin harita ile veri celismez.
+func (v *vehicleState) step(rng *rand.Rand, dt, speedFactor float64) float64 {
 	// Hiz zaman zaman degisir (trafik yogunlugu hissi vermek icin)
 	v.speed += (rng.Float64() - 0.5) * 8
 	if v.speed < 0 {
@@ -113,12 +173,31 @@ func (v *vehicleState) step(rng *rand.Rand) {
 	// Yon zaman zaman hafifce sapar
 	v.heading = (v.heading + rng.Intn(21) - 10 + 360) % 360
 
-	// Konumu hiz ve yone gore kaydir (kaba bir yaklasim, gercek yol agi degil)
+	effectiveSpeed := v.speed * speedFactor
+
+	// km/h -> m/s -> bu adimda alinan metre
+	meters := effectiveSpeed * 1000 / 3600 * dt
+
 	rad := float64(v.heading) * math.Pi / 180
-	deltaLat := math.Cos(rad) * v.speed * 0.00001
-	deltaLng := math.Sin(rad) * v.speed * 0.00001
-	v.lat += deltaLat
-	v.lng += deltaLng
+	dLat, dLng := metersToDegrees(math.Cos(rad)*meters, math.Sin(rad)*meters, v.lat)
+	v.lat += dLat
+	v.lng += dLng
+
+	// Bolgede tutma: arac kendi bolgesinin yaricapini asarsa merkeze dogru
+	// yonlendirilir. Bu olmadan arac saatler icinde sehrin disina cikar ama
+	// zoneIdx hic degismedigi icin zone_id etiketi yanlis kalir - yani veri
+	// yalan soyler. Ayrica haritada araclar Marmara'ya acilir.
+	z := zones[v.zoneIdx]
+	if distanceMeters(v.lat, v.lng, z.LatBase, z.LngBase) > zoneRadiusMeters {
+		towardCenter := math.Atan2(
+			(z.LngBase-v.lng)*math.Cos(v.lat*math.Pi/180),
+			z.LatBase-v.lat,
+		) * 180 / math.Pi
+		// Tam merkeze kilitlenmesin diye +-30 derece jitter
+		v.heading = ((int(towardCenter)+rng.Intn(61)-30)%360 + 360) % 360
+	}
+
+	return effectiveSpeed
 }
 
 func getenv(key, fallback string) string {
@@ -126,6 +205,47 @@ func getenv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+// --- Faz 8: anomali demo modu ------------------------------------------------
+//
+// Anomali tespitinin gercekten calistigini canli gosterebilmek icin periyodik
+// olarak bir bolgeyi yapay olarak tikariz. Uretim verisini bilerek bozdugu
+// icin VARSAYILAN KAPALI: docker-compose.yml bunu acikca acar, prod override
+// ve benchmark olcumleri kapali birakir (yoksa bolgesel hiz metrikleri
+// kirlenir ve benchmark sonucu yaniltici olur).
+
+const (
+	demoCongestionFactor = 0.25             // tikanik bolgede hiz %25'e duser
+	demoPeriod           = 60 * time.Second // ne siklikla yeni bir bolge secilir
+	demoDuration         = 20 * time.Second // tikaniklik ne kadar surer
+)
+
+// congestedZone: o an yapay olarak tikanik olan bolgenin indeksi, -1 = yok.
+// Yayin dongusu bunu her ping'de okudugu icin atomik.
+var congestedZone atomic.Int32
+
+func init() { congestedZone.Store(-1) }
+
+// speedFactorFor, verilen bolge icin uygulanacak hiz carpanini dondurur.
+func speedFactorFor(zoneIdx int) float64 {
+	if congestedZone.Load() == int32(zoneIdx) {
+		return demoCongestionFactor
+	}
+	return 1.0
+}
+
+func runAnomalyDemo(rng *rand.Rand) {
+	for {
+		time.Sleep(demoPeriod - demoDuration)
+		idx := rng.Intn(len(zones))
+		congestedZone.Store(int32(idx))
+		log.Printf("[producer] DEMO: %s bolgesi %v boyunca yapay olarak tikandi",
+			zones[idx].ID, demoDuration)
+		time.Sleep(demoDuration)
+		congestedZone.Store(-1)
+		log.Printf("[producer] DEMO: %s bolgesi normale dondu", zones[idx].ID)
+	}
 }
 
 func writeWithRetry(ctx context.Context, writer *kafka.Writer, batch []kafka.Message, maxAttempts int) error {
@@ -149,9 +269,17 @@ func main() {
 	targetRate, _ := strconv.Atoi(getenv("TARGET_RATE_PER_SEC", "50000"))
 	vehicleCount, _ := strconv.Atoi(getenv("VEHICLE_COUNT", "20000"))
 	workerCount, _ := strconv.Atoi(getenv("PRODUCER_WORKERS", "8"))
+	anomalyDemo := getenv("TEST_ANOMALY_DEMO", "false") == "true"
 
-	log.Printf("[producer] baslatiliyor: brokers=%s topic=%s hedef_hiz=%d/sn arac_sayisi=%d",
-		brokers, topic, targetRate, vehicleCount)
+	// Ayni aracin iki ping'i arasinda gecen sure. Her arac saniyede
+	// targetRate/vehicleCount kez ping'lendigi icin dt bunun tersidir
+	// (2000 arac, 5000 msg/sn -> 0.4 sn). step() konum degisimini bu sureden
+	// turetir; yanlis bir dt, araclarin bildirdikleri hizdan farkli bir hizla
+	// hareket ediyormus gibi gorunmesine yol acar.
+	dt := float64(vehicleCount) / float64(targetRate)
+
+	log.Printf("[producer] baslatiliyor: brokers=%s topic=%s hedef_hiz=%d/sn arac_sayisi=%d ping_araligi=%.3fsn anomali_demo=%v",
+		brokers, topic, targetRate, vehicleCount, dt, anomalyDemo)
 
 	writer := &kafka.Writer{
 		Addr:         kafka.TCP(brokers),
@@ -176,6 +304,10 @@ func main() {
 	vehicles := make([]*vehicleState, vehicleCount)
 	for i := 0; i < vehicleCount; i++ {
 		vehicles[i] = newVehicle("v-"+strconv.Itoa(i), rng)
+	}
+
+	if anomalyDemo {
+		go runAnomalyDemo(rand.New(rand.NewSource(time.Now().UnixNano() + 9999)))
 	}
 
 	ticker := time.NewTicker(time.Second)
@@ -226,14 +358,14 @@ func main() {
 						idx = idx % len(vehicles)
 					}
 					v := vehicles[idx]
-					v.step(workerRng)
+					speed := v.step(workerRng, dt, speedFactorFor(v.zoneIdx))
 
 					zone := zones[v.zoneIdx]
 					ping := VehiclePing{
 						VehicleID: v.id,
 						Lat:       v.lat,
 						Lng:       v.lng,
-						SpeedKmh:  math.Round(v.speed*10) / 10,
+						SpeedKmh:  math.Round(speed*10) / 10,
 						Heading:   v.heading,
 						Timestamp: time.Now().UTC(),
 						ZoneID:    zone.ID,

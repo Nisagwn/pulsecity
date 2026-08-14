@@ -1,0 +1,22 @@
+# PulseCity — CI ortamı override'ı (Faz 10)
+#
+# Kullanım:
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.ci.yml up -d --build
+#
+# GitHub Actions runner'ı 2-4 vCPU ile çalışır; local'deki yük profiliyle
+# ayağa kaldırmak testi yavaşlatır ve gereksiz yere kırılgan yapar. Buradaki
+# amaç throughput ölçmek değil, boru hattının uçtan uca ÇALIŞTIĞINI kanıtlamak:
+# producer üretiyor, consumer işliyor, DLQ boş, harita yanıt veriyor.
+
+services:
+  scylla:
+    command: --smp 1 --memory 1G --overprovisioned 1 --api-address 0.0.0.0
+
+  producer:
+    environment:
+      TARGET_RATE_PER_SEC: "1000"
+      VEHICLE_COUNT: "500"
+      PRODUCER_WORKERS: "2"
+      # Demo modu CI'da kapalı: yapay tıkanıklık ortalama hız metriklerini
+      # bozar ve doğrulama adımlarını yanıltabilir.
+      TEST_ANOMALY_DEMO: "false"
