@@ -42,6 +42,7 @@ izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
 ├── producer/                # Go load generator (sanal araç GPS ping üreteci)
 ├── consumer/                # Go consumer (Kafka -> ScyllaDB, DLQ, anomali tespiti)
 ├── webviz/                  # Go WebSocket servisi + Leaflet canlı harita (Faz 9)
+│                            # + ScyllaDB'den geçmişe bakma (Faz 11)
 ├── scylla-init/schema.cql   # ScyllaDB şema tanımı
 ├── monitoring/              # Prometheus config + Grafana provisioning/dashboard
 ├── scripts/                 # zero-loss testi, benchmark, chaos testing scriptleri
@@ -213,6 +214,58 @@ hareket etmesine yol açıyordu. Ayrıca boylam enleme göre ölçeklenmiyordu (
 Ayrıca build altyapısı düzeltildi: `go.sum` dosyaları eklendi ve Dockerfile'lar
 `go mod tidy` yerine `go mod download` kullanacak şekilde yeniden yazıldı — build artık
 tekrarlanabilir ve bağımlılık katmanı önbelleğe alınabiliyor.
+
+### Faz 11 — Zaman Yolculuğu ✅
+Faz 10'a kadar ScyllaDB'ye **yazılan veri hiçbir yerde okunmuyordu**: harita Kafka'dan
+canlı akışı izliyor, consumer ise kayıtları yalnızca yazıyordu. Depolama katmanı
+"yaz ve unut" durumundaydı. Bu faz o boşluğu kapatır.
+
+Haritanın altındaki zaman kaydırıcısı geriye çekildiğinde kareler Kafka'dan değil
+ScyllaDB'den okunur — son 30 dakikanın herhangi bir anına gidip trafiği izleyebilirsin.
+
+- `webviz/history.go`: okuma yolu + `GET /api/history?at=<unix>` uç noktası
+- **Sorgu deseni şemayla birebir örtüşüyor**: `zone_id` partition key olduğu için her bölge
+  sorgusu tek partition'a iner, `ping_time` clustering key ve `DESC` sıralı olduğu için
+  zaman aralığı diskte zaten bitişik duran satırlardan okunur. Yani "Üsküdar'ın 14:32'si"
+  bir tarama değil, sıralanmış aralık okumasıdır — Faz 1'deki partition key kararının
+  karşılığı burada alınır
+- **Bölge başına satır tavanı** (`HISTORY_ROWS_PER_ZONE`, varsayılan 2000): 50k/sn'de
+  2 saniyelik pencere bölge başına ~11k satır eder. Tavan olmadan tek bir kare için yüz
+  binlerce satır okunurdu; ortalama hız ve merkez bu örneklem üzerinden de sağlıklı çıkar.
+  Arayüz bunu gizlemez, geçmiş modda etiket `/sn` yerine `örnek` yazar
+- **Bağlantı arka planda kurulur, `depends_on` eklenmedi**: geçmiş okuma kritik yol değil.
+  Scylla geç açılsa ya da düşse canlı harita çalışmaya devam eder, yalnızca kaydırıcı
+  gizlenir (`/api/history/meta` → `enabled: false`). Aynı yaklaşım Prometheus için de geçerli
+- **Anomali sinyali geçmiş kareye taşınmaz**: Prometheus yalnızca anlık değeri tutuyor,
+  onu geçmiş bir kareye yapıştırmak "14:32'de anomali vardı" gibi yanlış bir şey söylerdi
+- **Oynatma sabit gecikmeyle çalışır**: kaydırıcının değeri sabit bir *offset*'tir, istenen
+  an `now + offset` olarak hesaplanır. Offset sabit kaldığı için zaman kendiliğinden 1x
+  hızda ilerler — ayrıca bir sayaç ya da hız çarpanı gerekmez
+- `history_integration_test.go` (`-tags=integration`): birim testler `historyQuerier`
+  arayüzünü sahteleyip snapshot mantığını doğruluyor ama **sorgu metnini** doğrulayamıyor.
+  CQL'deki bir yazım hatası ya da desteklenmeyen kalıp (LIMIT'te bind parametresi,
+  DISTINCT partition key okuması) ancak gerçek veritabanında ortaya çıkar. Bu test gerçek
+  ScyllaDB'ye karşı koşar; `SCYLLA_TEST_HOSTS` tanımsızsa atlanır, normal `go test` ve CI
+  akışı ayakta bir veritabanı gerektirmez
+
+**Harita okunabilirliği düzeltmesi (aynı fazda):** efsane yalnızca bölge renklerini
+listeliyordu, oysa araç noktaları ayrı bir skala kullanıyor ve o skaladaki mavi
+(30-49 km/h) efsanede hiç geçmiyordu. Üstelik aynı yeşil bölgede "40+", araçta "50+"
+anlamına geliyordu. Üç değişiklik yapıldı:
+
+- Efsane iki başlığa ayrıldı (*Bölge · ortalama hız* / *Araç · anlık hız*) ve her satıra
+  eşik sayıları yazıldı — hangi rengin neyi anlattığı artık ima değil, yazılı
+- **Anomali renk kanalından çıkarıldı.** Önce `zoneColor()` anomaliyi düz kırmızıya
+  boyuyordu; bu, akşam trafiğinde doğal olarak yavaşlayan bir bölge ile gerçekten
+  anormal bir bölgeyi ayırt edilemez hale getiriyordu. Renk artık yalnızca tıkanıklık
+  şiddetini gösteriyor, anomali ise onun *üstüne* binen kesikli kalın halka + `⚠`
+  işareti olarak çiziliyor. İki farklı soru, iki farklı görsel kanal
+- **Anomali animasyonu ilk kez gerçekten çalışıyor:** harita `preferCanvas: true` ile
+  açıldığı ve bölge çemberlerine ayrı renderer verilmediği için çemberler canvas'a
+  çiziliyordu; `circle._path` (SVG elemanı) hiç oluşmadığından `.anomaly-ring` sınıfı
+  hiçbir zaman uygulanmıyordu. Bölge çemberleri artık SVG renderer kullanıyor (9 çember,
+  maliyeti önemsiz; 1500 araç noktası canvas'ta kalmaya devam ediyor). Kesikli çizgi
+  ayrıca ekran görüntüsünde de durur — sinyalin yalnızca animasyona bağlı kalmaması için
 
 ## Sonuçları doğrulama sırası
 

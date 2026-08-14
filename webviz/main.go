@@ -88,8 +88,17 @@ type statsOut struct {
 	Shown     int `json:"shown"`
 }
 
+// Snapshot'in kaynagi: canli Kafka akisi mi, ScyllaDB'den okunan gecmis mi.
+// Tarayici tarafi ayni cizim koduyla ikisini de isler, yalnizca etiketleri
+// ve anomali gosterimini bu alana gore degistirir.
+const (
+	modeLive    = "live"
+	modeHistory = "history"
+)
+
 type snapshot struct {
-	Ts int64 `json:"ts"`
+	Ts   int64  `json:"ts"`
+	Mode string `json:"mode"`
 	// Araclar kompakt dizi olarak gonderilir ([lat, lng, hiz]) - obje olarak
 	// gondermek alan adlarini her arac icin tekrarlar ve yuku ~3 katina cikarir.
 	Vehicles [][]float64 `json:"vehicles"`
@@ -273,6 +282,7 @@ func (h *hub) buildSnapshot(signals map[string]zoneSignal, windowSeconds float64
 
 	return snapshot{
 		Ts:       time.Now().Unix(),
+		Mode:     modeLive,
 		Vehicles: vehicles,
 		Zones:    zoneList,
 		Stats: statsOut{
@@ -464,10 +474,24 @@ func main() {
 	intervalMs, _ := strconv.Atoi(getenv("BROADCAST_INTERVAL_MS", "1000"))
 	maxVehicles, _ := strconv.Atoi(getenv("MAX_VEHICLES_ON_MAP", "1500"))
 
+	scyllaHosts := getenv("SCYLLA_HOSTS", "localhost:9042")
+	histWindowMs, _ := strconv.Atoi(getenv("HISTORY_WINDOW_MS", "2000"))
+	histMaxAgeSec, _ := strconv.Atoi(getenv("HISTORY_MAX_AGE_SECONDS", "1800"))
+	// Bolge basina satir tavani: 50k/sn'de 2 saniyelik pencere bolge basina
+	// ~11k satir eder. Tavan olmadan tek bir kare icin yuz binlerce satir
+	// okunurdu; ortalama hiz ve merkez bu ornek uzerinden de saglikli cikar.
+	histRowsPerZone, _ := strconv.Atoi(getenv("HISTORY_ROWS_PER_ZONE", "2000"))
+
 	log.Printf("[webviz] baslatiliyor: brokers=%s topic=%s group=%s yayin=%dms max_arac=%d",
 		brokers, topic, groupID, intervalMs, maxVehicles)
 
 	h := newHub(maxVehicles)
+	history := newHistoryStore(
+		time.Duration(histWindowMs)*time.Millisecond,
+		time.Duration(histMaxAgeSec)*time.Second,
+		histRowsPerZone,
+		maxVehicles,
+	)
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: []string{brokers},
@@ -484,6 +508,10 @@ func main() {
 	defer reader.Close()
 
 	ctx := context.Background()
+
+	// Scylla baglantisi arka planda kurulur; hazir olana kadar harita canli
+	// modda calisir, yalnizca zaman kaydiricisi kapali kalir.
+	go history.connect(ctx, scyllaHosts)
 
 	go func() {
 		for {
@@ -530,6 +558,8 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/history", history.handleSnapshot)
+	mux.HandleFunc("/api/history/meta", history.handleMeta)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)

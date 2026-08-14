@@ -37,9 +37,18 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: #f85149; }
   .dot.on { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
 
-  #legend { bottom: 12px; right: 12px; font-size: 12px; }
-  #legend .item { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+  #legend { bottom: 12px; right: 12px; font-size: 11px; }
+  #legend .item { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+  /* Aynı yeşilin bölgede 40+, araçta 50+ demesi kafa karıştırıyordu; başlıklar
+     ve eşik sayıları hangi rengin neyi anlattığını yazılı hale getiriyor. */
+  .lg-head { font-size: 10px; text-transform: uppercase; letter-spacing: .7px;
+    color: var(--muted); margin: 8px 0 4px; }
+  .lg-head:first-child { margin-top: 0; }
   .swatch { width: 14px; height: 14px; border-radius: 3px; flex: none; }
+  /* Araç noktaları haritada küçük daireler; örneği de öyle görünsün. */
+  .swatch.dot-sw { width: 9px; height: 9px; border-radius: 50%; margin: 0 2px; }
+  /* Anomali bir renk değil, çemberin biçimi: kesikli halka. */
+  .swatch.ring { background: none; border: 2px dashed var(--text); border-radius: 50%; }
 
   #alerts { top: 12px; right: 12px; width: 260px; max-height: 45vh; overflow-y: auto; }
   #alerts h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
@@ -52,6 +61,23 @@
 
   @keyframes pulse { 0%,100% { opacity:.75 } 50% { opacity:.25 } }
   .anomaly-ring { animation: pulse 1.1s ease-in-out infinite; }
+
+  /* Zaman kaydiricisi: ScyllaDB'deki gecmise bakmak icin */
+  #timebar { bottom: 12px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 10px;
+    width: min(560px, calc(100vw - 24px)); }
+  #timebar[hidden] { display: none; }
+  .tb-btn { background: #1c2530; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 11px; font: inherit; font-size: 12px;
+    cursor: pointer; flex: none; }
+  .tb-btn:hover { border-color: var(--accent); }
+  .tb-btn.active { background: var(--accent); border-color: var(--accent);
+    color: #06121f; font-weight: 700; }
+  #time-slider { flex: 1; accent-color: var(--accent); cursor: pointer; min-width: 0; }
+  #time-label { font-variant-numeric: tabular-nums; font-size: 12px;
+    color: var(--muted); min-width: 96px; text-align: right; flex: none; }
+  /* Gecmis modunda paneller sari cerceve alir - canli sanip yanlis okumayi onler */
+  body.history #stats, body.history #timebar { border-color: #d29922; }
 
   .leaflet-container { background: var(--bg); }
   .zone-label { background: none; border: none; box-shadow: none;
@@ -79,11 +105,26 @@
   <div id="alert-list"><div class="quiet">Tüm bölgeler normal.</div></div>
 </div>
 
+<div id="timebar" class="panel" hidden>
+  <button id="live-btn" class="tb-btn active" title="Canlı yayına dön">CANLI</button>
+  <button id="play-btn" class="tb-btn" title="Geçmişi oynat">▶</button>
+  <input id="time-slider" type="range" min="-1800" max="0" value="0" step="1"
+         aria-label="Zaman kaydırıcısı">
+  <span id="time-label">canlı</span>
+</div>
+
 <div id="legend" class="panel">
-  <div class="item"><span class="swatch" style="background:#3fb950"></span>Akıcı</div>
-  <div class="item"><span class="swatch" style="background:#d29922"></span>Yoğun</div>
-  <div class="item"><span class="swatch" style="background:#db6d28"></span>Çok yoğun</div>
-  <div class="item"><span class="swatch" style="background:#f85149"></span>Anomali — normalin %40 altı</div>
+  <div class="lg-head">Bölge · ortalama hız</div>
+  <div class="item"><span class="swatch" style="background:#3fb950"></span>Akıcı — 40+ km/h</div>
+  <div class="item"><span class="swatch" style="background:#d29922"></span>Yoğun — 25-39 km/h</div>
+  <div class="item"><span class="swatch" style="background:#db6d28"></span>Çok yoğun — 25 altı</div>
+  <div class="item"><span class="swatch ring"></span>⚠ Anomali — normalin %40 altı</div>
+
+  <div class="lg-head">Araç · anlık hız</div>
+  <div class="item"><span class="swatch dot-sw" style="background:#f85149"></span>15 km/h altı</div>
+  <div class="item"><span class="swatch dot-sw" style="background:#d29922"></span>15-29 km/h</div>
+  <div class="item"><span class="swatch dot-sw" style="background:#58a6ff"></span>30-49 km/h</div>
+  <div class="item"><span class="swatch dot-sw" style="background:#3fb950"></span>50+ km/h</div>
 </div>
 
 <script>
@@ -97,6 +138,11 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
 
 // Araç noktaları canvas üzerinde çizilir - 1500 nokta için SVG çok yavaş kalır.
 const vehicleLayer = L.canvas({ padding: 0.3 });
+
+// Bölge çemberleri ise SVG üzerinde: sayıları 9, maliyeti önemsiz. Buna karşılık
+// SVG olmadan `circle._path` oluşmuyor ve anomali halkasının CSS animasyonu hiç
+// uygulanamıyor (harita preferCanvas:true ile açıldığı için varsayılan canvas).
+const zoneRenderer = L.svg();
 const zoneLayer = L.layerGroup().addTo(map);
 
 let vehicleMarkers = [];
@@ -123,9 +169,13 @@ function districtName(id) {
   return DISTRICT_NAMES[id] || id.replace(/^istanbul-/, '').replace(/-/g, ' ');
 }
 
-// Bölge rengi: önce anomali, sonra ortalama hız. Düşük hız = tıkanıklık.
+// Bölge rengi YALNIZCA tıkanıklığı anlatır. Anomali ayrı bir eksen: "yavaş mı"
+// ile "normalinden sapmış mı" farklı sorular. İkisini tek renk kanalına
+// bindirmek, saat 18:00'de doğal olarak yavaşlayan bir bölge ile gerçekten
+// anormal bir bölgeyi aynı kırmızıya boyuyordu - projenin asıl anlattığı
+// sinyal (Faz 8 anomali tespiti) böylece kayboluyordu. Anomali artık kesikli
+// halka + ⚠ ile, rengin ÜSTÜNE binen bir işaret olarak gösteriliyor.
 function zoneColor(z) {
-  if (z.anomaly) return '#f85149';
   if (z.avg_speed < 25) return '#db6d28';
   if (z.avg_speed < 40) return '#d29922';
   return '#3fb950';
@@ -138,7 +188,10 @@ function speedColor(s) {
   return '#3fb950';
 }
 
-function renderZones(zones) {
+function renderZones(zones, mode) {
+  // Geçmiş modda satır sayısı bir ÖRNEKLEM (bölge başına tavan var), canlı
+  // moddaki gibi "saniyedeki ping" değil. Etiket bunu gizlemez.
+  const unit = mode === 'history' ? 'örnek' : '/sn';
   const bounds = [];
   for (const z of zones) {
     if (!z.lat && !z.lng) continue;
@@ -151,6 +204,7 @@ function renderZones(zones) {
 
     if (!entry) {
       const circle = L.circle([z.lat, z.lng], {
+        renderer: zoneRenderer,
         radius, color, fillColor: color,
         fillOpacity: 0.18, weight: 2
       }).addTo(zoneLayer);
@@ -164,7 +218,15 @@ function renderZones(zones) {
 
     entry.circle.setLatLng([z.lat, z.lng]);
     entry.circle.setRadius(radius);
-    entry.circle.setStyle({ color, fillColor: color, fillOpacity: z.anomaly ? 0.34 : 0.18 });
+    // Anomali rengi DEĞİL, çemberin biçimini değiştirir: kesikli ve kalın halka.
+    // Kesikli çizgi ekran görüntüsünde de durur - animasyona güvenmek, projeyi
+    // statik bir kareden inceleyen birine sinyali hiç göstermezdi.
+    entry.circle.setStyle({
+      color, fillColor: color,
+      fillOpacity: z.anomaly ? 0.34 : 0.18,
+      weight: z.anomaly ? 4 : 2,
+      dashArray: z.anomaly ? '7 5' : null
+    });
     if (entry.circle._path) {
       entry.circle._path.classList.toggle('anomaly-ring', !!z.anomaly);
     }
@@ -172,13 +234,18 @@ function renderZones(zones) {
     const name = districtName(z.id);
     entry.label.setLatLng([z.lat, z.lng]);
     entry.label.getElement().innerHTML =
-      `<span class="zone-name">${name}</span><br>${z.avg_speed.toFixed(0)} km/h · ${z.pings}/sn`;
+      `<span class="zone-name">${z.anomaly ? '⚠ ' : ''}${name}</span>` +
+      `<br>${z.avg_speed.toFixed(0)} km/h · ${z.pings}${unit}`;
 
     entry.circle.bindTooltip(
       `<b>${name}</b><br>` +
-      `Yoğunluk: ${z.pings} ping/sn<br>` +
+      (mode === 'history'
+        ? `Okunan kayıt: ${z.pings}<br>`
+        : `Yoğunluk: ${z.pings} ping/sn<br>`) +
       `Ortalama hız: ${z.avg_speed.toFixed(1)} km/h<br>` +
-      `Öğrenilen normal: ${z.baseline ? z.baseline.toFixed(1) + ' km/h' : '—'}` +
+      (mode === 'history'
+        ? '<i>ScyllaDB kaydı</i>'
+        : `Öğrenilen normal: ${z.baseline ? z.baseline.toFixed(1) + ' km/h' : '—'}`) +
       (z.anomaly ? '<br><b style="color:#f85149">ANOMALİ</b>' : ''),
       { sticky: true }
     );
@@ -215,9 +282,15 @@ function renderVehicles(list) {
   vehicleMarkers.length = list.length;
 }
 
-function renderAlerts(zones) {
-  const bad = zones.filter(z => z.anomaly);
+function renderAlerts(zones, mode) {
   const el = document.getElementById('alert-list');
+  // Anomali sinyali Prometheus'tan gelir ve yalnızca ANLIK değeri tutar;
+  // geçmiş bir kareye yapıştırmak yanlış bilgi olurdu (bkz. history.go).
+  if (mode === 'history') {
+    el.innerHTML = '<div class="quiet">Geçmiş modunda anomali sinyali gösterilmez.</div>';
+    return;
+  }
+  const bad = zones.filter(z => z.anomaly);
   if (!bad.length) {
     el.innerHTML = '<div class="quiet">Tüm bölgeler normal.</div>';
     return;
@@ -240,6 +313,19 @@ function setStatus(ok, text) {
   document.getElementById('conn-txt').textContent = text;
 }
 
+// Canlı ve geçmiş kareler AYNI şemada geldiği için tek çizim yolu yeterli.
+function renderSnapshot(snap) {
+  const mode = snap.mode || 'live';
+  renderZones(snap.zones || [], mode);
+  renderVehicles(snap.vehicles || []);
+  renderAlerts(snap.zones || [], mode);
+  document.getElementById('mps').textContent = snap.stats.msg_per_sec.toLocaleString('tr-TR');
+  document.getElementById('veh').textContent = snap.stats.vehicles.toLocaleString('tr-TR');
+  document.getElementById('shown').textContent = snap.stats.shown.toLocaleString('tr-TR');
+  // Geçmiş karede "bağlı izleyici" diye bir kavram yok.
+  document.getElementById('cli').textContent = mode === 'history' ? '—' : snap.stats.clients;
+}
+
 // --- WebSocket, üstel geri çekilmeli yeniden bağlanma ---
 let ws, retry = 0;
 
@@ -250,14 +336,10 @@ function connect() {
   ws.onopen = () => { retry = 0; setStatus(true, 'canlı'); };
 
   ws.onmessage = (ev) => {
-    const snap = JSON.parse(ev.data);
-    renderZones(snap.zones || []);
-    renderVehicles(snap.vehicles || []);
-    renderAlerts(snap.zones || []);
-    document.getElementById('mps').textContent = snap.stats.msg_per_sec.toLocaleString('tr-TR');
-    document.getElementById('veh').textContent = snap.stats.vehicles.toLocaleString('tr-TR');
-    document.getElementById('shown').textContent = snap.stats.shown.toLocaleString('tr-TR');
-    document.getElementById('cli').textContent = snap.stats.clients;
+    // Geçmişe bakılıyorsa canlı kareler çizilmez, ama bağlantı açık tutulur:
+    // "CANLI"ya dönüş böylece anında olur.
+    if (offset !== 0) return;
+    renderSnapshot(JSON.parse(ev.data));
   };
 
   ws.onclose = () => {
@@ -268,6 +350,97 @@ function connect() {
 
   ws.onerror = () => ws.close();
 }
+
+// --- Zaman yolculuğu --------------------------------------------------------
+// Kaydırıcı geriye çekildiğinde kareler Kafka'dan değil ScyllaDB'den okunur.
+//
+// "offset" sabit bir GECİKME'dir (canlıdan kaç saniye geride). Sabit kaldığı
+// için istenen an (now + offset) gerçek zamanla birlikte ilerler; oynatma bu
+// yüzden kendiliğinden 1x hızda olur, ayrıca bir sayaç gerekmez.
+
+let offset = 0;           // saniye, 0 = canlı
+let playing = false;
+let historyTimer = null;
+let historyWindow = 2;    // sunucudaki okuma penceresi (saniye)
+
+const timebar   = document.getElementById('timebar');
+const slider    = document.getElementById('time-slider');
+const timeLabel = document.getElementById('time-label');
+const liveBtn   = document.getElementById('live-btn');
+const playBtn   = document.getElementById('play-btn');
+
+function clockAt(off) {
+  return new Date(Date.now() + off * 1000)
+    .toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function agoText(off) {
+  const s = -off;
+  return s < 60 ? `−${s} sn` : `−${Math.round(s / 60)} dk`;
+}
+
+async function fetchHistory() {
+  const at = Math.floor(Date.now() / 1000) + offset;
+  try {
+    const res = await fetch(`/api/history?at=${at}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    renderSnapshot(await res.json());
+    setStatus(false, `geçmiş · ${clockAt(offset)}`);
+  } catch (err) {
+    // Geçmiş okunamazsa canlı harita etkilenmez; kullanıcı CANLI'ya dönebilir.
+    setStatus(false, `geçmiş okunamadı (${err.message})`);
+  }
+}
+
+function stopPlay() {
+  playing = false;
+  clearInterval(historyTimer);
+  historyTimer = null;
+  playBtn.textContent = '▶';
+  playBtn.classList.remove('active');
+}
+
+function startPlay() {
+  if (offset === 0) return;
+  playing = true;
+  playBtn.textContent = '❚❚';
+  playBtn.classList.add('active');
+  historyTimer = setInterval(fetchHistory, historyWindow * 1000);
+}
+
+function setOffset(off) {
+  offset = Math.min(0, Math.round(off));
+  slider.value = offset;
+  timeLabel.textContent = offset === 0 ? 'canlı' : `${clockAt(offset)} · ${agoText(offset)}`;
+  document.body.classList.toggle('history', offset !== 0);
+  liveBtn.classList.toggle('active', offset === 0);
+
+  if (offset === 0) {
+    stopPlay();
+    setStatus(ws && ws.readyState === WebSocket.OPEN, 'canlı');
+    return;   // sonraki kare WebSocket'ten gelir
+  }
+  fetchHistory();
+}
+
+slider.addEventListener('input', () => setOffset(Number(slider.value)));
+liveBtn.addEventListener('click', () => setOffset(0));
+playBtn.addEventListener('click', () => {
+  if (playing) stopPlay();
+  else if (offset !== 0) startPlay();
+});
+
+// Sunucu ScyllaDB'ye bağlanamadıysa kaydırıcı hiç gösterilmez - çalışmayan
+// bir kontrol sunmaktansa yokmuş gibi davranmak daha iyi.
+fetch('/api/history/meta')
+  .then(res => res.json())
+  .then(meta => {
+    if (!meta.enabled) return;
+    historyWindow = meta.window_seconds || historyWindow;
+    slider.min = -(meta.max_age_seconds || 1800);
+    timebar.hidden = false;
+  })
+  .catch(() => {});
 
 connect();
 </script>

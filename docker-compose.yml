@@ -137,6 +137,13 @@ services:
       LISTEN_ADDR: ":8080"
       BROADCAST_INTERVAL_MS: "1000"
       MAX_VEHICLES_ON_MAP: "1500"
+      # Zaman yolculugu: gecmis kareler ScyllaDB'den okunur.
+      # depends_on BILEREK eklenmedi - baglanti arka planda kuruluyor, Scylla
+      # gec acilsa ya da dusse bile canli harita calismaya devam etmeli.
+      SCYLLA_HOSTS: "scylla:9042"
+      HISTORY_WINDOW_MS: "2000"
+      HISTORY_MAX_AGE_SECONDS: "1800"
+      HISTORY_ROWS_PER_ZONE: "2000"
 
   prometheus:
     image: prom/prometheus:v2.53.0
