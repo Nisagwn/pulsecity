@@ -44,7 +44,7 @@ izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
 ├── webviz/                  # Go WebSocket servisi + Leaflet canlı harita (Faz 9)
 │                            # + ScyllaDB'den geçmişe bakma (Faz 11)
 ├── scylla-init/schema.cql   # ScyllaDB şema tanımı
-├── monitoring/              # Prometheus config + alarm kuralları, Alertmanager,
+├── monitoring/              # Prometheus + alarm kuralları, Alertmanager, Loki/Promtail,
 │                            # Grafana provisioning/dashboard
 ├── scripts/                 # zero-loss testi, benchmark, chaos testing scriptleri
 ├── deploy/                  # Production/CI compose override, Caddy (TLS), Nginx, VPS rehberi
@@ -62,8 +62,13 @@ Servisler ayağa kalktıktan (~30sn) sonra:
 
 - **Canlı harita**: http://localhost:8080 — bölgeler yoğunluğa göre renklenir,
   araçlar nokta olarak akar, anomali tespit edilen bölge kırmızı yanıp söner
-- **Grafana**: http://localhost:3000 (admin / pulsecity) — canlı dashboard
+- **Grafana**: http://localhost:3000 (admin / pulsecity) — canlı dashboard +
+  log paneli (Faz 17)
 - **Prometheus**: http://localhost:9090 — ham metrikler
+- **Alertmanager**: http://localhost:9093 — alarm durumu, gruplama ve
+  susturma (Faz 13)
+- **Loki**: http://localhost:3100 — log sorgusu; Grafana'dan da erişilebilir
+  (Faz 17)
 - ScyllaDB'de veri doğrulama: `docker exec -it pulsecity-scylla cqlsh -e "SELECT * FROM pulsecity.vehicle_pings LIMIT 10;"`
 
 Consumer'ı paralel ölçeklendirmek için:
@@ -610,6 +615,63 @@ HTTP→HTTPS redirects"*) · yönlendirme sahte backend'lerle uçtan uca test ed
 > HSTS'in bir yan etkisi var: tarayıcı bir kez aldıktan sonra o alan adına
 > HTTP ile gitmeyi bir yıl boyunca reddeder. HTTPS'ten geri dönmen gerekirse
 > önce `max-age=0` yayınlaman gerekir.
+
+### Faz 17 — Log Toplama (Loki + Promtail) ✅
+Metrikler *"ne kadar"*, loglar *"neden"* sorusunu yanıtlar. Faz 13'te üç Go
+servisi `log/slog` ile JSON'a, Faz 16'da Caddy de JSON erişim loguna geçmişti —
+bu faz o hazırlığın karşılığını alıyor.
+
+**Promtail Docker API'den keşif yapıyor** (`docker_sd_configs`), dosya tabanlı
+okuma yerine. Avantajı: konteyner etiketlerine erişebiliyoruz ve yeni
+konteynerler otomatik yakalanıyor. Bedeli, Docker soketine erişim — salt okunur
+bağlandı, ama soket üzerinden okuma yetkisi bile önemsiz değil; paylaşılan bir
+ortamda araya `docker-socket-proxy` gibi bir katman konmalı. Tek makine/tek
+operatör için kabul edilebilir.
+
+**JSON ayrıştırma yalnızca JSON yazan servislere uygulanıyor.** Kafka, ScyllaDB
+ve Prometheus düz metin yazar; onlara `json` stage uygulamak her satırda
+ayrıştırma hatası üretirdi. `match` selector'ı bunu ayırıyor.
+
+**`zone_id` bilerek etiket DEĞİL.** Loki log *içeriğini* indekslemez, yalnızca
+*etiketleri* indeksler; her benzersiz etiket kombinasyonu ayrı bir stream açar.
+Asıl gerekçe kardinalite de değil (9 değer sınırda kabul edilebilirdi):
+`zone_id` yalnızca *bazı* satırlarda var (anomali logları). Yalnızca bazı
+satırlarda bulunan bir alanı etiketlemek aynı servisin loglarını iki ayrı
+stream'e böler ve zaman sırası içinde okumayı zorlaştırır. Sorgu anında
+ayrıştırmak hem doğru hem yeterince hızlı:
+
+```logql
+{compose_service="consumer"} | json | zone_id="istanbul-uskudar"
+{compose_service="consumer", level="ERROR"}
+```
+
+Grafana'ya Loki datasource'u ve dashboard'a bir **log paneli** eklendi
+(`level=~"WARN|ERROR"`). Sorgu seviye *etiketine* göre filtrelediği için log
+içeriğini taramak zorunda kalmıyor.
+
+**Doğrulama sırasında yanıltıcı bir sonuç.** İlk kontrolde Loki'de yalnızca
+`grafana`, `kafka` ve `scylla` görünüyordu; üç Go servisi yoktu. İlk bakışta
+yapılandırma hatası gibi duruyor — ama değildi: Faz 13'te rutin log satırlarını
+(`batch işlendi`, saniyelik tur) `Debug` seviyesine indirmiştim ve varsayılan
+`LOG_LEVEL=info`. Yani o servisler açılıştan sonra **gerçekten hiç log
+yazmıyordu**; gönderilecek bir şey yoktu. Servisleri yeniden başlatınca
+loglar anında göründü.
+
+Bu, gözlemlenebilirlik kurarken kolay bir yanılgı: *boş panel* ile *bozuk
+boru hattı* aynı görünür. Ayırt etmenin yolu, kaynağın gerçekten veri üretip
+üretmediğini önce doğrulamak.
+
+**Saklama süresi** 7 gün. Aynı ders üçüncü kez: kalıcı disk eklenen her bileşen,
+politika yazılmazsa sınırsız büyür (Kafka → Faz 13, ScyllaDB → Faz 13, Loki →
+burada). Loki'de ek bir incelik var: `limits_config.retention_period` tek başına
+yetmez, `compactor.retention_enabled: true` de gerekir — yoksa politika yazılmış
+ama işletilmiyor olur.
+
+**Ölçülen sonuçlar:** Promtail 11 konteyneri keşfetti · `level` (INFO/ERROR) ve
+`service` etiketleri JSON'dan üretildi · `zone_id` etiket listesinde **yok**,
+ama `| json | zone_id="istanbul-uskudar"` sorgusu 3 stream döndürdü · ScyllaDB
+durdurularak gerçek `ERROR` üretildi ve dashboard panelinin sorgusu
+(`level=~"WARN|ERROR"`) eşleşen kayıtları getirdi.
 
 ## Sonuçları doğrulama sırası
 

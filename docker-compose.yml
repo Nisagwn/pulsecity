@@ -258,6 +258,42 @@ services:
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
 
+  # --- Faz 17: log toplama ---
+  #
+  # Metrikler "ne kadar", loglar "neden" sorusunu yanitlar. Faz 13'te uc Go
+  # servisi JSON log'a gecmisti; bu adim o hazirligin karsiligi.
+  loki:
+    image: grafana/loki:3.1.1
+    container_name: pulsecity-loki
+    ports:
+      # Yerelde dogrudan sorgulanabilsin (Prometheus/Alertmanager gibi).
+      # Prod override bunu kapatir; erisim Grafana uzerinden olur.
+      - "3100:3100"
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./monitoring/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready | grep -q ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  promtail:
+    image: grafana/promtail:3.1.1
+    container_name: pulsecity-promtail
+    command: ["-config.file=/etc/promtail/promtail-config.yml"]
+    volumes:
+      - ./monitoring/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      # Docker API uzerinden konteyner kesfi icin. SALT OKUNUR - Promtail'in
+      # yazma yetkisine ihtiyaci yok (bkz. promtail-config.yml'daki not).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail-positions:/tmp
+    depends_on:
+      loki:
+        condition: service_healthy
+
   grafana:
     image: grafana/grafana:11.1.0
     container_name: pulsecity-grafana
@@ -276,3 +312,5 @@ services:
 volumes:
   kafka-data:
   scylla-data:
+  loki-data:
+  promtail-positions:

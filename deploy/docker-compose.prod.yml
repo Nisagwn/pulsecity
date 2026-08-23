@@ -6,7 +6,7 @@
 # Bu dosya, local docker-compose.yml'in ÜZERİNE gelen bir override'dır:
 # - Kaynak limitleri ekler (paylaşımlı/ucuz VPS'te sistemin boğulmasını önlemek için)
 # - restart policy ekler (VPS reboot sonrası otomatik ayağa kalkma)
-# - Grafana/Prometheus portlarını sadece Nginx üzerinden dışa açacak şekilde kısıtlar
+# - Grafana/Prometheus portlarını sadece Caddy üzerinden dışa açacak şekilde kısıtlar
 #   (doğrudan internete açık bırakmak yerine reverse proxy arkasına alır)
 # - Ortam değişkenlerini .env dosyasından okur (bkz. .env.example)
 
@@ -55,7 +55,7 @@ services:
 
   prometheus:
     restart: unless-stopped
-    ports: []   # doğrudan dışa kapalı, Nginx reverse proxy üzerinden erişilir (istenirse)
+    ports: []   # doğrudan dışa kapalı; arayüzüne SSH tüneli ile bakılır
     deploy:
       resources:
         limits:
@@ -72,7 +72,8 @@ services:
       # dosyada DEĞİL — `slack_api_url_file` ile aşağıdaki dizinden okunuyor.
       - ./monitoring/alertmanager.prod.yml:/etc/alertmanager/alertmanager.yml:ro
       # SOPS ile çözülmüş sırlar. Bu dizin .gitignore'da ve deploy sırasında
-      # üretiliyor (bkz. scripts/deploy-secrets.sh, cloud-init).
+      # cloud-init tarafından üretiliyor (age anahtarı SSM'den okunur;
+      # bkz. infra/terraform/cloud-init.yaml).
       - ./secrets/decrypted:/etc/alertmanager/secrets:ro
     deploy:
       resources:
@@ -88,9 +89,27 @@ services:
           cpus: "0.25"
           memory: 128M
 
+  # Faz 17: log toplama.
+  loki:
+    restart: unless-stopped
+    ports: []   # disa kapali; erisim Grafana uzerinden
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  promtail:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
   webviz:
     restart: unless-stopped
-    ports: []   # doğrudan dışa kapalı, Nginx reverse proxy üzerinden "/" olarak servis edilir
+    ports: []   # doğrudan dışa kapalı, Caddy üzerinden "/" olarak servis edilir
     deploy:
       resources:
         limits:
@@ -99,7 +118,7 @@ services:
 
   grafana:
     restart: unless-stopped
-    ports: []   # doğrudan dışa kapalı, Nginx reverse proxy (deploy/nginx.conf) üzerinden erişilir
+    ports: []   # doğrudan dışa kapalı, Caddy (deploy/Caddyfile) üzerinden /grafana/ olarak erişilir
     environment:
       GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER}"
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"
