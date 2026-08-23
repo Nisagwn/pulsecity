@@ -1,0 +1,153 @@
+# PulseCity — Prometheus alarm kurallari (Faz 13)
+#
+# Faz 12'ye kadar sistem saf GOZLEMLENEBILIRDI: metrikler toplaniyor, Grafana'da
+# cizdiriliyordu ama birinin ekrana bakmasi gerekiyordu. Bu dosya o boslugu
+# kapatir - sinyal artik operatoru ariyor.
+#
+# Siddet secimi kasitli:
+#   critical -> veri kaybi riski ya da boru hattinin durmasi (hemen mudahale)
+#   warning  -> bozulma egilimi, henuz kayip yok (mesai icinde bakilir)
+#
+# `for` sureleri tek bir scrape dalgalanmasinin alarm uretmesini engeller.
+# Ozellikle batch'li bir sistemde anlik degerler testere disi seklinde
+# oynadigi icin (bkz. README Faz 3 lag grafigi) bu sure kritik: `for` olmadan
+# saglikli bir sistem surekli alarm verirdi.
+
+groups:
+  - name: pulsecity-kritik
+    interval: 15s
+    rules:
+      # --- Zero-loss ihlali: en yuksek oncelikli alarm ---
+      #
+      # Bu sayac, ScyllaDB VE DLQ ayni anda yazilamadigi icin batch'in commit
+      # EDILMEDEN birakildigi durumda artar (bkz. consumer/main.go
+      # writeBatchToScylla). Veri henuz kaybolmadi - Kafka onlari yeniden
+      # teslim edecek - ama boru hatti ilerlemiyor demektir.
+      - alert: ConsumerBatchCommitEdilemiyor
+        expr: increase(pulsecity_consumer_uncommitted_batches_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Consumer batch'leri commit edemiyor (zero-loss yolu tikandi)"
+          description: >-
+            Son 5 dakikada {{ $value | printf "%.0f" }} batch, ScyllaDB'ye de
+            DLQ'ya da yazilamadigi icin commit edilmeden birakildi. Mesajlar
+            Kafka'da duruyor ve yeniden teslim ediliyor, ancak boru hatti
+            ilerlemiyor. Once ScyllaDB'nin, sonra Kafka broker'inin
+            erisilebilirligini kontrol et.
+
+      # --- Consumer'in ScyllaDB baglantisi koptu ---
+      #
+      # connectWithRetry yalnizca ACILISTA calisir; calisma sirasindaki bir
+      # kopus process'i coktermez. /readyz bu metrigi besler.
+      - alert: ConsumerScyllaBaglantisiYok
+        expr: pulsecity_consumer_scylla_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Consumer ScyllaDB'ye erisemiyor ({{ $labels.instance }})"
+          description: >-
+            Readiness sondasi 2 dakikadir basarisiz. Consumer process'i ayakta
+            ama her batch'i DLQ'ya yaziyor olabilir.
+
+      # --- Servis tamamen dustu ---
+      - alert: ServisKapali
+        expr: up{job=~"pulsecity-.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} scrape edilemiyor ({{ $labels.instance }})"
+          description: "Prometheus 1 dakikadir bu hedeften metrik alamiyor."
+
+      # --- Producer Kafka'ya yazamiyor ---
+      #
+      # writeWithRetry 5 kez denedikten SONRA bu sayac artar, yani gecici bir
+      # hiccup burayi tetiklemez - buraya ulasan her mesaj gercekten kayiptir.
+      - alert: ProducerYazmaHatasi
+        expr: rate(pulsecity_producer_errors_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Producer Kafka'ya yazamiyor"
+          description: >-
+            Retry'lar tukendikten sonra saniyede
+            {{ $value | printf "%.1f" }} mesaj kaybediliyor.
+
+      # --- Boru hatti durdu ---
+      #
+      # Producer uretiyor ama consumer islemiyorsa, ikisi de "ayakta" gorunse
+      # bile boru hatti kopmus demektir. `up` kontrolu bunu yakalayamaz.
+      - alert: BoruHattiDurdu
+        expr: >-
+          sum(rate(pulsecity_producer_messages_total[5m])) > 0
+          and
+          sum(rate(pulsecity_consumer_messages_processed_total[5m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Producer uretiyor ama consumer hic islemiyor"
+          description: >-
+            Iki servis de ayakta ve scrape ediliyor, ancak islenen mesaj sayisi
+            5 dakikadir artmiyor. Consumer group rebalance'da takilmis olabilir.
+
+  - name: pulsecity-uyari
+    interval: 15s
+    rules:
+      # --- DLQ dolmaya basladi ---
+      #
+      # DLQ'ya mesaj dusmesi veri kaybi DEGILDIR (mesaj korunuyor), ama
+      # saglikli bir sistemde oran sifir olmali. README'deki 50k/sn olcumunde
+      # DLQ orani 0 idi; sifirdan sapma bir regresyon isaretidir.
+      - alert: DLQDoluyor
+        expr: sum(rate(pulsecity_consumer_dlq_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mesajlar DLQ'ya yonlendiriliyor"
+          description: >-
+            Saniyede {{ $value | printf "%.1f" }} mesaj DLQ'ya dusuyor.
+            vehicle-pings-dlq topic'ini inceleyerek error_reason alanina bak.
+
+      # --- Consumer geride kaliyor ---
+      #
+      # Esik neden 200k: batch'leme yuzunden lag testere disi seklinde oynar
+      # (README Faz 3: tepe 48.000 mesaj, duzenli olarak 0'a iniyor). Tepe
+      # degerlerin cok uzerinde bir esik + 10 dakikalik `for`, "normal
+      # dalgalanma" ile "gercekten yetisemiyor"u ayirir. Kritik olan mutlak
+      # deger degil, lag'in DUZENLI OLARAK SIFIRLANMAMASIDIR.
+      - alert: ConsumerGerideKaliyor
+        expr: sum(kafka_consumergroup_lag{consumergroup="pulsecity-consumers"}) > 200000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consumer lag'i 10 dakikadir yuksek"
+          description: >-
+            Biriken mesaj: {{ $value | printf "%.0f" }}. Lag bu sure boyunca
+            hic sifirlanmadiysa sistem gelen hizi tasiyamiyor demektir -
+            `docker compose up -d --scale consumer=3` ile yatay olceklenebilir.
+
+      # --- ScyllaDB yazma gecikmesi bozuldu ---
+      #
+      # Esik 200ms: olculen p99 48.4ms (README Faz 3). Dort kati bir esik,
+      # normal degiskenligi kapsar ama gercek bir bozulmayi yakalar.
+      - alert: ScyllaYazmaGecikmesiYuksek
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (le) (rate(pulsecity_consumer_batch_write_seconds_bucket[5m]))
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ScyllaDB batch yazma p99 gecikmesi yuksek"
+          description: >-
+            p99 = {{ $value | printf "%.3f" }}sn (beklenen ~0.05sn). Compaction
+            baskisi ya da disk doygunlugu olabilir.
+

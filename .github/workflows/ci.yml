@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 env:
-  GO_VERSION: "1.22"
+  GO_VERSION: "1.26"
 
 jobs:
   # --- 1) Lint + derleme --------------------------------------------------
@@ -154,11 +154,105 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.yml -f deploy/docker-compose.ci.yml down -v
 
-  # --- 4) İmajları GHCR'a gönder ------------------------------------------
+  # --- 4) Tedarik zinciri: güvenlik taraması + SBOM ------------------------
+  #
+  # Bu job yayınlanacak imajın TAM OLARAK kendisini tarar: aynı Dockerfile,
+  # aynı digest'e sabitlenmiş base imaj. Sadece kaynak kodu taramak yetmez -
+  # açıkların çoğu uygulama kodunda değil, base imajın sistem paketlerinde olur.
+  #
+  # Neden `ignore-unfixed: true`: upstream'de henüz yaması olmayan bir CVE için
+  # build'i kırmak, yapılabilecek bir şey olmadığı halde boru hattını durdurur
+  # ve zamanla "kırmızıyı görmezden gelme" alışkanlığı yaratır. Yaması olan
+  # HIGH/CRITICAL ise gerçekten aksiyon alınabilir bir bulgudur - orada kırıyoruz.
+  security:
+    name: Güvenlik taraması & SBOM (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    needs: [lint-build]
+    permissions:
+      contents: read
+      security-events: write   # SARIF'i Security sekmesine yüklemek için
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [producer, consumer, webviz]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Taranacak imajı yerelde üret (push etmeden). docker-push job'ı aynı
+      # context'ten aynı imajı üretir; burada tarananla orada yayınlanan aynıdır.
+      - name: İmajı build et (yerel)
+        run: docker build -t pulsecity-${{ matrix.module }}:scan ${{ matrix.module }}
+
+      - name: Trivy — imaj açık taraması
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: pulsecity-${{ matrix.module }}:scan
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"        # yaması olan HIGH/CRITICAL varsa build kırılır
+
+      # Aynı taramanın SARIF çıktısı GitHub Security sekmesine yüklenir.
+      # exit-code YOK: burada amaç raporlamak, kırma kararını yukarıdaki adım verdi.
+      - name: Trivy — SARIF üret
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: pulsecity-${{ matrix.module }}:scan
+          format: sarif
+          output: trivy-${{ matrix.module }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          # Trivy, SARIF ciktisinda `severity` filtresini VARSAYILAN OLARAK
+          # uygulamaz - bu bayrak olmadan Security sekmesine LOW/MEDIUM dahil
+          # her sey duser ve yukaridaki kapiyla tutarsiz bir liste olusur.
+          limit-severities-for-sarif: true
+
+      - name: SARIF'i Security sekmesine yükle
+        if: always()
+        # Private repoda GitHub Advanced Security olmadan bu adım yetkisizlik
+        # verir; raporlama eksikliği CI'ı kırmamalı.
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.module }}.sarif
+          category: trivy-${{ matrix.module }}
+
+      # Dockerfile yanlış yapılandırmaları (root kullanıcı, sabitlenmemiş base
+      # imaj, gereksiz ayrıcalık). Faz 13'te düzeltilen sınıfın regresyon kilidi.
+      - name: Trivy — Dockerfile yapılandırma denetimi
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: ${{ matrix.module }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+      # SBOM (Software Bill of Materials): imajın içindeki her paketin makine
+      # okunur envanteri. Yeni bir CVE duyurulduğunda "bu imaj etkileniyor mu"
+      # sorusu imajı yeniden taramadan, SBOM üzerinden yanıtlanabilir.
+      - name: SBOM üret (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: pulsecity-${{ matrix.module }}:scan
+          format: spdx-json
+          output-file: sbom-${{ matrix.module }}.spdx.json
+
+      - name: SBOM'u artifact olarak sakla
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.module }}
+          path: sbom-${{ matrix.module }}.spdx.json
+          retention-days: 90
+
+  # --- 5) İmajları GHCR'a gönder ------------------------------------------
   docker-push:
     name: İmaj yayınla (${{ matrix.module }})
     runs-on: ubuntu-latest
-    needs: [integration]
+    # Güvenlik taraması geçmeden imaj yayınlanmaz: taramanın yayın yolunda
+    # KAPI olması, sadece rapor üretmesinden farklıdır.
+    needs: [integration, security]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
       contents: read
@@ -202,7 +296,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # --- 5) VPS'e dağıtım (henüz pasif) -------------------------------------
+  # --- 6) VPS'e dağıtım (henüz pasif) -------------------------------------
   #
   # Canlıya alma bilinçli olarak sonraya bırakıldı. Bu job iki koşul birden
   # saglanmadan ÇALIŞMAZ:

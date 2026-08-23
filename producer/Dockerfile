@@ -1,4 +1,15 @@
-FROM golang:1.22-alpine AS build
+# Base imajlar hem etiket hem digest ile sabitlenir.
+#
+# Neden digest: `golang:1.22-alpine` etiketi degisebilir bir isaretcidir - upstream
+# ayni etikete yeni bir imaj push'ladiginda build girdisi sessizce degisir ve
+# "ayni commit, farkli imaj" durumu olusur. Digest icerigin kendisini adresler,
+# yani build tekrarlanabilir hale gelir ve CI'daki guvenlik taramasi tam olarak
+# yayina gidecek katmanlari tarar.
+#
+# Bedeli: digest sabit oldugu icin base imaj guvenlik yamalari OTOMATIK gelmez.
+# Bu yuzden .github/dependabot.yml digest'leri haftalik olarak PR ile gunceller -
+# yama akisi kaybolmaz, sadece gorunur ve gozden gecirilebilir hale gelir.
+FROM golang:1.26-alpine@sha256:28d89ee9cc0ff9fec75c82ca201e6bf7fdf9a679d4b7b24dfa04f2bb766bb468 AS build
 WORKDIR /app
 # Bagimliliklar once kopyalanir: kod degistiginde bu katman onbellekten gelir,
 # modul indirme her build'de tekrarlanmaz. Ayrica go.sum sayesinde build
@@ -8,7 +19,23 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /producer .
 
-FROM alpine:3.19
-COPY --from=build /producer /producer
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+
+# Ayricaliksiz kullanici. Onceki surumde uc servis de root olarak calisiyordu:
+# konteynerden kacis zinciri kurulabilen bir acikta root, host'a dogru bir adim
+# daha yakin demek.
+#
+# Sabit UID (10001) bilerek: Kubernetes'te runAsNonRoot admission kontrolu
+# imajin sayisal bir UID bildirmesini ister, isim cozumlemesine guvenmez.
+RUN addgroup -g 10001 -S pulsecity \
+ && adduser  -u 10001 -S pulsecity -G pulsecity
+
+# Binary root'a ait ve salt-okunur: uygulama kendi calistirdigi dosyayi
+# degistiremesin.
+COPY --from=build --chown=root:root --chmod=0755 /producer /producer
+
+USER 10001:10001
+
+# 2112 > 1024 oldugu icin ayricaliksiz kullanici sorunsuz bind edebilir.
 EXPOSE 2112
 ENTRYPOINT ["/producer"]

@@ -1,0 +1,61 @@
+# Dependabot — bagimlilik ve base imaj guncellemeleri
+#
+# Bu dosya, Dockerfile'lardaki digest sabitlemesinin (pinning) karsi agirligidir.
+# Digest ile sabitlemek build'i tekrarlanabilir yapar ama base imaj guvenlik
+# yamalarinin otomatik akisini keser: `alpine:3.19` etiketi yeni bir yama
+# aldiginda digest'e sabitlenmis build eski katmanda kalir.
+#
+# Dependabot digest'leri haftalik olarak tarar ve degisiklik varsa PR acar.
+# Boylece yama akisi kaybolmaz, sadece OTOMATIK olmaktan cikip GOZDEN
+# GECIRILEBILIR hale gelir - CI (lint/test/integration + Trivy taramasi) her
+# PR'da kostugu icin guncelleme korumasiz birlesmez.
+
+version: 2
+updates:
+  # --- Base imajlar (digest guncellemeleri) ---
+  - package-ecosystem: "docker"
+    directory: "/producer"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "docker"]
+
+  - package-ecosystem: "docker"
+    directory: "/consumer"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "docker"]
+
+  - package-ecosystem: "docker"
+    directory: "/webviz"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "docker"]
+
+  # --- Go modulleri ---
+  # Uc ayri modul: her birinin kendi go.mod/go.sum'i var.
+  - package-ecosystem: "gomod"
+    directory: "/producer"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "go"]
+
+  - package-ecosystem: "gomod"
+    directory: "/consumer"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "go"]
+
+  - package-ecosystem: "gomod"
+    directory: "/webviz"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "go"]
+
+  # --- GitHub Actions ---
+  # Action'lar da tedarik zincirinin parcasi: `uses:` ile cekilen ucuncu parti
+  # action'lar CI runner'inda repo icerigine ve GITHUB_TOKEN'a erisir.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "ci"]

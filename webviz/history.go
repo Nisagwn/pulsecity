@@ -22,7 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -167,13 +167,16 @@ func (s *historyStore) connect(ctx context.Context, hosts string) {
 		session, err := cluster.CreateSession()
 		if err == nil {
 			s.setQuerier(&scyllaHistory{session: session})
-			log.Printf("[webviz] gecmis okuma hazir (scylla=%s)", hosts)
+			slog.Info("gecmis okuma hazir", "scylla_hosts", hosts, "attempts", attempt)
 			return
 		}
 		// Ilk denemeler ve sonrasinda dakikada bir loglanir - saniyede bir
 		// satir yazip loglari bogmamak icin.
 		if attempt <= 3 || attempt%12 == 0 {
-			log.Printf("[webviz] scylla baglantisi kurulamadi (deneme %d), gecmis okuma kapali: %v", attempt, err)
+			// Warn, Error degil: gecmis okuma kritik yol degil, canli harita
+			// bu olmadan da calisir (bkz. /readyz bilerek Scylla'ya bakmiyor).
+			slog.Warn("scylla baglantisi kurulamadi, gecmis okuma kapali",
+				"attempt", attempt, "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -375,7 +378,7 @@ func (s *historyStore) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	snap, err := s.snapshotAt(ctx, at)
 	if err != nil {
-		log.Printf("[webviz] gecmis sorgusu basarisiz: %v", err)
+		slog.Warn("gecmis sorgusu basarisiz", "err", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{
 			"error": "gecmis verisi okunamadi",
 		})

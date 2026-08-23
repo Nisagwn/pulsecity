@@ -267,6 +267,160 @@ anlamına geliyordu. Üç değişiklik yapıldı:
   maliyeti önemsiz; 1500 araç noktası canvas'ta kalmaya devam ediyor). Kesikli çizgi
   ayrıca ekran görüntüsünde de durur — sinyalin yalnızca animasyona bağlı kalmaması için
 
+### Faz 12 — Canlıya Alma Sertleştirmesi ✅
+Faz 11'e kadar sistem *çalışıyordu* ama production'da ilk gerçek arızada kırılacak
+beş boşluk vardı. Hepsi kod okunarak bulundu, hiçbiri README'nin "bilinen
+sınırlamalar" listesinde yazmıyordu.
+
+| Boşluk | Neden ciddiydi | Çözüm |
+|---|---|---|
+| **Kalıcı disk yoktu** | Kafka ve ScyllaDB verisi container'ın yazılabilir katmanındaydı; bir `docker compose down`, recreate ya da imaj güncellemesi topic'leri, commit edilmiş offset'leri ve tüm ping geçmişini siliyordu | `kafka-data` ve `scylla-data` named volume'leri |
+| **Çifte hata anında sessiz veri kaybı** | `writeBatchToScylla` void'di. ScyllaDB **ve** DLQ aynı anda yazılamadığında yalnızca bir log satırı basılıyor, offset yine de commit ediliyordu — zero-loss iddiasını tam olarak bu senaryoda bozan bir açık | Fonksiyon artık hata döndürüyor; hata varsa **commit edilmiyor**, Kafka mesajları yeniden teslim ediyor. DLQ yazımı ayrıca 3 kez retry ediliyor |
+| **Prometheus 3 replikanın 1'ini ölçüyordu** | Prod 3 consumer replikası çalıştırıyor ama scrape hedefi `consumer:2113` statikti; Docker DNS bu adı round-robin çözdüğü için her scrape rastgele bir replikaya gidiyordu. Throughput, DLQ ve anomali metrikleri eksik ve zıplayan değerlerdi | `dns_sd_configs` ile A kaydındaki tüm replikalar. Grafana panelleri ve webviz'in Prometheus okuması replika-güvenli hale getirildi (`sum`/`max by (zone_id)`) |
+| **Health/readiness sondası yoktu** | `connectWithRetry` yalnızca **açılışta** çalışıyor. ScyllaDB bağlantısı çalışma sırasında koparsa consumer çökmeden her batch'i DLQ'ya yazmaya devam eder ve dışarıdan bakan hiçbir şey bunu fark etmezdi | Üç serviste `/healthz` (liveness) + `/readyz` (bağımlılık kontrolü) ve compose healthcheck'leri |
+| **Graceful shutdown yoktu** | Her deploy Docker'ın SIGTERM→SIGKILL akışına tabi; consumer batch ortasında kesiliyordu | `signal.NotifyContext` ile SIGTERM yakalama, son batch'i temiz bir context ile flush, WebSocket istemcilerine `CloseGoingAway` |
+
+**Readiness sondalarının sınırları bilinçli:** webviz'in `/readyz`'ı ScyllaDB'ye
+**bakmaz** — geçmişe bakma kritik yol değil, Scylla düşse bile canlı harita sağlıklı
+sayılmalı (Faz 11'deki `depends_on` kararıyla aynı mantık). Producer'ın `/readyz`'ı
+"son başarılı Kafka yazmasının üzerinden 30sn geçti mi"ye bakar; eşik
+`writeWithRetry`'ın toplam backoff'undan belirgin biçimde büyük seçildi ki geçici bir
+broker hiccup'ı restart tetiklemesin.
+
+**Ölçülen sonuçlar** (CI profili, ayakta duran stack üzerinde):
+
+| Doğrulama | Sonuç |
+|---|---|
+| ScyllaDB durdurulduğunda consumer `/readyz` | **503**, Docker healthcheck 3 denemede `unhealthy`'ye döndü |
+| Aynı anda consumer `/healthz` | **200** — liveness readiness'tan ayrı, tasarlandığı gibi |
+| Aynı anda webviz `/readyz` | **200** — Scylla'ya bilerek bakmıyor, harita sağlıklı sayıldı |
+| ScyllaDB geri açıldığında | gocql session'ı kendiliğinden bağlandı, `/readyz` → 200, restart gerekmedi |
+| SIGTERM sonrası çıkış kodları | üçü de **0** (temiz kapanış); değişiklikten önce 137 = SIGKILL olurdu |
+| `down` + `up` sonrası ScyllaDB | 153.430 satır **korundu** (volume öncesi sıfırlanırdı) |
+| `down` + `up` sonrası Kafka | `pulsecity-consumers` grubunun commit edilmiş offset'leri **korundu** |
+| Prometheus hedefleri | consumer artık DNS ile IP bazlı keşfediliyor (`172.19.0.6:2113`), 3 replikada 3 hedef |
+
+**Hâlâ eksik olan:** alerting kuralı (Grafana `provisioning/alerting/` yok — DLQ
+patlasa kimse haberdar olmaz), ScyllaDB TTL ve Kafka `retention.bytes` politikası
+(veri artık kalıcı olduğu için sınırsız büyür), yapılandırılmış log (`log/slog`).
+Ayrıca çifte-hata anında commit etmeme davranışının **birim testi yok**:
+`writeBatchToScylla` somut `*gocql.Session` ve `*kafka.Writer` aldığı için
+sahtelenemiyor; Faz 11'in `historyQuerier` deseni buraya da uygulanabilir.
+
+### Faz 13 — DevOps Sertleştirmesi ✅
+Faz 12 sistemi *dayanıklı* hale getirdi. Bu faz onu *işletilebilir* yapar:
+tedarik zinciri, log hijyeni, veri yaşam döngüsü ve alarm zinciri.
+
+**Tedarik zinciri (supply chain)**
+
+- **Konteynerler artık root çalışmıyor.** Üç imaj da sabit UID 10001 ile
+  ayrıcalıksız bir kullanıcıya geçti. UID'nin *sayısal* olması bilinçli:
+  Kubernetes'in `runAsNonRoot` admission kontrolü isim çözümlemesine güvenmez.
+- **Base imajlar digest ile sabitlendi.** `alpine:3.22` gibi bir etiket
+  değişebilir bir işaretçidir; upstream aynı etikete yeni imaj push'ladığında
+  build girdisi sessizce değişir. Digest içeriğin kendisini adresler.
+  Bedeli, güvenlik yamalarının otomatik gelmemesi — bu yüzden
+  `.github/dependabot.yml` digest'leri haftalık PR olarak açar: yama akışı
+  kaybolmuyor, **görünür ve gözden geçirilebilir** hale geliyor.
+- **CI'da Trivy + SBOM.** Yayınlanacak imajın tam olarak kendisi taranıyor ve
+  tarama yayın yolunda bir **kapı** (`docker-push`, `security` job'ına bağlı) —
+  sadece rapor üretmiyor. SPDX formatında SBOM artifact olarak saklanıyor.
+  `ignore-unfixed: true` bilinçli: yaması olmayan bir CVE için build'i kırmak,
+  yapılabilecek bir şey yokken boru hattını durdurur ve zamanla "kırmızıyı
+  görmezden gelme" alışkanlığı yaratır.
+
+**Taramanın ilk çalıştırmada bulduğu şey — ve neden önemli:** tarama eklendiği
+anda **22 bulgu** çıkardı (21 HIGH + 1 CRITICAL). Kök neden uygulama kodu
+değil, **EOL olmuş Go 1.22 toolchain'iydi**: `CVE-2025-68121`, `crypto/tls`
+içinde hatalı sertifika doğrulaması. Ayrıca webviz'de transitif
+`golang.org/x/net v0.20.0` 7 HIGH taşıyordu. Doğru cevap bunları bastırmak
+değil, kaynağı düzeltmekti — Go 1.22→1.26, Alpine 3.19→3.22,
+`x/net` 0.20→0.58. **Sonuç: 22 → 0.** Bu, taramanın dekoratif olmadığının
+kanıtı; gerçek bir açığı yakalayıp kapattı.
+
+**Yapılandırılmış log**
+
+Üç servis de `log/slog` ile JSON yazıyor (`LOG_FORMAT=text` yerel okuma için,
+`LOG_LEVEL` ile seviye). Önceki sürümde her satır elle biçimlenmiş düz metindi:
+bölgeye göre filtrelemek ya da hız eşiğine göre alarm kurmak için o metni
+regex'le parse etmek gerekirdi. Artık `{"zone_id":"istanbul-sisli-1"}` doğrudan
+sorgulanabilir. Seviye ayrımı da yeni — önceden ANOMALİ ile "batch işlendi"
+aynı seviyedeydi, "sadece hataları göster" diye bir filtre kurulamıyordu.
+Yüksek hacimli rutin satırlar (batch/saniyelik tur) `Debug`'a indirildi;
+ilerlemenin asıl ölçüsü zaten Prometheus sayaçları.
+
+`slog.SetDefault` standart `log` paketini de bu handler'a yönlendirdiği için
+gocql ve kafka-go'nun kendi logları da otomatik olarak yapılandırılmış hale
+geliyor.
+
+**Veri yaşam döngüsü**
+
+Faz 12'de kalıcı disk eklenince veri artık restart'ları aşıyor — yani sınırsız
+büyüyor. Bu faz politikayı açık yazar:
+
+| Ne | Politika | Gerekçe |
+|---|---|---|
+| Kafka `vehicle-pings` | `retention.ms` = 1 saat, `retention.bytes` = 512 MiB/partition (≈6 GiB toplam) | Broker varsayılanı 7 gün + sınırsız boyut. 50k msg/sn ≈ saatte 36 GB |
+| Kafka `segment.bytes` | 128 MiB | Kafka yalnızca **kapanmış** segmentleri siler; 1 GiB'lik varsayılan segmentle 512 MiB'lik tavan asla devreye giremez, politika sessizce etkisiz kalırdı |
+| Kafka DLQ | 7 gün | Oradaki mesajlar incelenmek için var; ana topic ile aynı politika, hata ayıklanacak kanıtı bir saat sonra silmek olurdu |
+| ScyllaDB `vehicle_pings` | `default_time_to_live=3600` | Haritanın geriye bakabildiği pencerenin (30 dk) iki katı |
+| ScyllaDB compaction | `TimeWindowCompactionStrategy` (10 dk pencere) | Zaman serisi + TTL için doğru strateji. Varsayılan SizeTiered farklı zamanlara ait SSTable'ları birleştirir; süresi dolan satırlar taze verinin içine karışır ve alan ancak pahalı bir compaction sonrası geri alınır. TWCS'te tamamen dolmuş pencere **dosya silinerek** geri kazanılır |
+| ScyllaDB `gc_grace_seconds` | 3600 (varsayılan 10 gün) | Varsayılan, node'lar arası repair penceresi bırakır. RF=1 tek node'da replika yok, dolayısıyla o risk de yok — 10 günlük varsayılan sadece tombstone biriktirirdi. RF=3'e çıkılırsa yükseltilmeli |
+
+**Alarm zinciri**
+
+Faz 12'ye kadar sistem saf gözlemlenebilirdi: metrikler toplanıyor, çizdiriliyor
+ama birinin ekrana bakması gerekiyordu. Artık sinyal operatörü arıyor —
+Prometheus kuralları + Alertmanager (gruplama, susturma, inhibition).
+
+8 kural, `critical`/`warning` ayrımıyla. En yüksek öncelikli olan
+`ConsumerBatchCommitEdilemiyor`: Faz 12'de eklenen
+`pulsecity_consumer_uncommitted_batches_total` sayacını izler, yani **zero-loss
+yolunun tıkandığı anı** yakalar.
+
+- **`for` süreleri kritik.** Batch'li bir sistemde anlık değerler testere dişi
+  oynar (bkz. Faz 3 lag grafiği); `for` olmadan sağlıklı bir sistem sürekli
+  alarm verirdi. Lag eşiği (200k) ölçülen tepe değerin (48k) çok üzerinde
+  seçildi — kritik olan mutlak değer değil, **lag'in düzenli olarak
+  sıfırlanmaması**.
+- **Inhibition kuralları** türev alarmları bastırır: ScyllaDB erişilemezken
+  DLQ'nun dolması beklenen davranıştır, ayrı bir olay değil.
+- **Consumer lag artık bir zaman serisi.** Önceden yalnızca
+  `kafka-consumer-groups` CLI'sıyla, `benchmark.sh` içinden okunuyordu — yani
+  sadece elle ölçüm sırasında görülebiliyor, üzerine alarm kurulamıyordu.
+  `kafka-exporter` bunu sürekli ölçülen bir metriğe çevirdi.
+- **Bildirim kanalı bilerek boş**: gerçek bir Slack webhook'u bu depoya sabit
+  yazılamaz. Alarmların üretildiği ve doğru gruplandığı Alertmanager arayüzünden
+  (`:9093`) doğrulanabilir; `alertmanager.yml` içinde Slack örneği yorumda.
+
+**Ölçülen sonuçlar** (ayakta duran stack üzerinde):
+
+| Doğrulama | Sonuç |
+|---|---|
+| Konteyner kullanıcısı | üçü de `uid=10001(pulsecity)` — root değil |
+| Trivy imaj taraması | **22 bulgu → 0** (Go 1.26 + Alpine 3.22 + x/net 0.58 sonrası) |
+| Log formatı | üçü de JSON, `service`/`level`/alan bazlı |
+| Kafka `vehicle-pings` | `retention.ms=3600000`, `retention.bytes=536870912`, `segment.bytes=134217728` uygulandı (varsayılan `log.retention.bytes=-1` override edildi) |
+| Kafka DLQ | `retention.ms=604800000` (7 gün) |
+| ScyllaDB tablosu | `default_time_to_live=3600`, `gc_grace_seconds=3600`, TWCS 10 dk pencere |
+| Prometheus | 8 kural yüklendi, Alertmanager bağlı |
+| `kafka_consumergroup_lag` | 24 seri, toplam lag okunabiliyor |
+| **Uçtan uca alarm testi** | ScyllaDB durduruldu → `ConsumerScyllaBaglantisiYok` (critical) **aktif**, `DLQDoluyor` (warning) **suppressed** — inhibition kuralı türev semptomu bastırdı. ScyllaDB geri açıldığında sekiz kural da `inactive`'e döndü |
+
+**Yol boyunca yakalanan bir tuzak:** Kafka retention'ı ilk sürümde `--config`
+bayraklarıyla, ters bölü satır devamı kullanılarak yazılmıştı. Compose bu bloğu
+işlerken ters bölüleri yutuyor ve `--config ...` ayrı bir komut olarak
+çalıştırılmaya kalkıyor (`--config: command not found`). **Topic yine oluşuyor,
+komut sıfır dönüyor, ama retention politikası sessizce uygulanmıyordu.**
+Doğrulama adımı olmasa fark edilmezdi. Çözüm: komutlar tek satıra alındı ve
+oluşturma (`--create`) ile yapılandırma (`--alter`) ayrıldı — `--alter` her
+çalışmada politikayı yeniden dayattığı için bu dosya mevcut bir kuruluma da
+güvenle uygulanabiliyor.
+
+**Hâlâ eksik olan:** IaC (Terraform — `deploy/DEPLOY.md` hâlâ elle SSH adımları),
+secret yönetimi (`.env` seviyesinde, SOPS/Vault yok), TLS, log toplama
+(Loki/Promtail), ve çifte-hata anında commit etmeme davranışının birim testi.
+
 ## Sonuçları doğrulama sırası
 
 Projeyi baştan sona kendi ortamında doğrulamak istersen:

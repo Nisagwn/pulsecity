@@ -1,0 +1,65 @@
+# PulseCity — Alertmanager yapilandirmasi (Faz 13)
+#
+# Alertmanager, Prometheus'un urettigi alarmlari gruplar, susturur ve bir
+# bildirim kanalina yollar. Prometheus tek basina alarmi YALNIZCA hesaplar -
+# kime, hangi sirayla, ne siklikta gidecegine bu servis karar verir.
+
+route:
+  # Ayni anda patlayan alarmlari tek bildirimde toplar: ScyllaDB dustugunde
+  # ConsumerScyllaBaglantisiYok + DLQDoluyor + ScyllaYazmaGecikmesiYuksek
+  # ayni koke sahiptir; ucunu ayri ayri gondermek gurultuden baska bir sey
+  # uretmez.
+  group_by: ["alertname", "severity"]
+
+  # Ilk bildirimden once kisa bir bekleme: ayni olaydan dogan diger alarmlarin
+  # da gruba katilmasina firsat verir.
+  group_wait: 30s
+  # Ayni gruba yeni alarm eklendiginde tekrar bildirim araligi.
+  group_interval: 5m
+  # Cozulmemis bir alarmin hatirlatma araligi.
+  repeat_interval: 4h
+
+  receiver: "default"
+
+  routes:
+    # critical olanlar daha hizli cikar ve daha sik hatirlatilir.
+    - matchers:
+        - severity = "critical"
+      receiver: "critical"
+      group_wait: 10s
+      repeat_interval: 1h
+
+# Bir alarm digerinin sonucuysa, kok nedeni gosterip turevi susturur.
+inhibit_rules:
+  # Servis tamamen kapaliysa, o servisin diger alarmlarini bastir.
+  - source_matchers:
+      - alertname = "ServisKapali"
+    target_matchers:
+      - severity = "warning"
+    equal: ["instance"]
+
+  # ScyllaDB erisilemezken DLQ'nun dolmasi beklenen davranistir, ayri bir
+  # sorun degil - kok neden zaten bildirildi.
+  - source_matchers:
+      - alertname = "ConsumerScyllaBaglantisiYok"
+    target_matchers:
+      - alertname = "DLQDoluyor"
+
+receivers:
+  # Bu kurulumda bildirim kanali bilerek BOS birakildi: gercek bir Slack
+  # webhook'u ya da SMTP sunucusu bu depoya sabit yazilamaz (secret olur) ve
+  # portfolyo demosunda calisan bir kanal gerekmez. Alarmlarin uretildigi ve
+  # dogru gruplandigi Alertmanager arayuzunden (http://localhost:9093)
+  # dogrulanabilir.
+  #
+  # Slack'e baglamak icin .env'den okunan bir webhook ile:
+  #
+  #   receivers:
+  #     - name: "critical"
+  #       slack_configs:
+  #         - api_url: "${SLACK_WEBHOOK_URL}"
+  #           channel: "#pulsecity-alerts"
+  #           title: "{{ .CommonAnnotations.summary }}"
+  #           text: "{{ .CommonAnnotations.description }}"
+  - name: "default"
+  - name: "critical"

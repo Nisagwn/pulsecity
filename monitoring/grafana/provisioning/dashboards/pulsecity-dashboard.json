@@ -16,7 +16,7 @@
           "legendFormat": "üretilen (producer)"
         },
         {
-          "expr": "rate(pulsecity_consumer_messages_processed_total[30s])",
+          "expr": "sum(rate(pulsecity_consumer_messages_processed_total[30s]))",
           "legendFormat": "işlenen (consumer)"
         }
       ]
@@ -32,7 +32,7 @@
           "legendFormat": "producer hataları"
         },
         {
-          "expr": "rate(pulsecity_consumer_dlq_total[30s])",
+          "expr": "sum(rate(pulsecity_consumer_dlq_total[30s]))",
           "legendFormat": "DLQ'ya yönlendirilen"
         }
       ]
@@ -44,7 +44,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "targets": [
         {
-          "expr": "rate(pulsecity_vehicle_pings_by_zone_total[30s])",
+          "expr": "sum by (zone_id) (rate(pulsecity_vehicle_pings_by_zone_total[30s]))",
           "legendFormat": "{{zone_id}}"
         }
       ]
@@ -56,7 +56,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "targets": [
         {
-          "expr": "pulsecity_vehicle_avg_speed_kmh",
+          "expr": "avg by (zone_id) (pulsecity_vehicle_avg_speed_kmh)",
           "legendFormat": "{{zone_id}}"
         }
       ]
@@ -68,15 +68,15 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(pulsecity_consumer_batch_write_seconds_bucket[1m]))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(pulsecity_consumer_batch_write_seconds_bucket[1m])))",
           "legendFormat": "p50"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(pulsecity_consumer_batch_write_seconds_bucket[1m]))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(pulsecity_consumer_batch_write_seconds_bucket[1m])))",
           "legendFormat": "p95"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(pulsecity_consumer_batch_write_seconds_bucket[1m]))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(pulsecity_consumer_batch_write_seconds_bucket[1m])))",
           "legendFormat": "p99"
         }
       ]
@@ -88,7 +88,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "targets": [
         {
-          "expr": "pulsecity_consumer_messages_processed_total",
+          "expr": "sum(pulsecity_consumer_messages_processed_total)",
           "legendFormat": "toplam işlenen"
         }
       ]
@@ -129,7 +129,7 @@
       },
       "targets": [
         {
-          "expr": "pulsecity_zone_anomaly_detected",
+          "expr": "max by (zone_id) (pulsecity_zone_anomaly_detected)",
           "legendFormat": "{{zone_id}}"
         }
       ]
@@ -159,11 +159,11 @@
       },
       "targets": [
         {
-          "expr": "pulsecity_vehicle_avg_speed_kmh",
+          "expr": "avg by (zone_id) (pulsecity_vehicle_avg_speed_kmh)",
           "legendFormat": "{{zone_id}} mevcut"
         },
         {
-          "expr": "pulsecity_zone_speed_baseline_kmh",
+          "expr": "avg by (zone_id) (pulsecity_zone_speed_baseline_kmh)",
           "legendFormat": "{{zone_id}} baseline"
         }
       ]

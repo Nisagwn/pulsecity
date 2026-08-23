@@ -2,20 +2,49 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+# Faz 13: alarm kurallari. Prometheus bunlari degerlendirir, Alertmanager
+# gruplar ve yollar.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: "pulsecity-producer"
     static_configs:
       - targets: ["producer:2112"]
 
   - job_name: "pulsecity-consumer"
-    static_configs:
-      # Faz 3'te consumer birden fazla replica ile calisirsa (docker compose
-      # --scale consumer=3), Prometheus'un hepsini gormesi icin bu satir
-      # yerine bir service-discovery mekanizmasi (ör. dns_sd_configs) gerekir.
-      # Faz 4 MVP'sinde tek consumer'i hedefliyoruz.
-      - targets: ["consumer:2113"]
+    # Consumer TEK replika degil: prod override'i 3 replika ile calistiriyor
+    # (deploy/docker-compose.prod.yml) ve local'de `--scale consumer=3`
+    # mumkun. static_configs ile "consumer:2113" yazmak, Docker'in embedded
+    # DNS'i bu adi round-robin cozdugu icin her scrape'te RASTGELE bir
+    # replikayi olcerdi - throughput toplami eksik, DLQ sayaci eksik ve
+    # Faz 8'in anomali metrikleri gelip giden bir sey haline gelirdi.
+    #
+    # dns_sd_configs A kaydinin TUM adreslerini hedef olarak alir, boylece
+    # replika sayisi degistiginde config'e dokunmaya gerek kalmaz.
+    dns_sd_configs:
+      - names: ["consumer"]
+        type: A
+        port: 2113
+        refresh_interval: 15s
 
   # Faz 9: harita servisi (bagli istemci sayisi, yayin sayaclari)
   - job_name: "pulsecity-webviz"
     static_configs:
       - targets: ["webviz:8080"]
+
+  # Faz 13: consumer lag.
+  #
+  # Lag, boru hattinin yetisip yetismedigini gosteren EN durust olcuttur ama
+  # Kafka'nin kendi metrigi olduğu icin uygulama kodundan expose edilemez.
+  # Onceden yalnizca `kafka-consumer-groups` CLI'siyla, benchmark.sh icinden
+  # okunuyordu - yani sadece elle olcum sirasinda gorulebiliyordu ve uzerine
+  # alarm kurulamiyordu. Exporter bunu surekli bir zaman serisine cevirir.
+  - job_name: "kafka-exporter"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
