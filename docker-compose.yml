@@ -258,6 +258,47 @@ services:
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
 
+  # --- Faz 18: blue-green icin yesil kopya ---
+  #
+  # Normalde CALISMAZ - `bluegreen` profili arkasinda duruyor. Yalnizca
+  # ./scripts/deploy-webviz.sh calistiginda ayaga kalkar.
+  #
+  # Neden sadece webviz: consumer zaten `--scale consumer=3` ile yatay ve
+  # Kafka consumer group'u rebalance'i kendisi yonetiyor; kesintisiz deploy'a
+  # gercekten ihtiyac duyan tek katman kullaniciya bakan taraf. Stateful
+  # bilesenler (Kafka, ScyllaDB) blue-green'e HIC girmiyor - iki kopya ayni
+  # veriyi paylasamaz.
+  webviz-green:
+    profiles: ["bluegreen"]
+    build:
+      context: ./webviz
+    container_name: pulsecity-webviz-green
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "vehicle-pings"
+      # AYRI consumer group: yesil kopya mavi kopyadan mesaj CALMAMALI.
+      # Ayni group'u paylassalardi Kafka partition'lari ikiye boler ve her
+      # iki harita da akisin yalnizca yarisini gorurdu.
+      KAFKA_GROUP_ID: "pulsecity-webviz-green"
+      PROM_URL: "http://prometheus:9090"
+      LISTEN_ADDR: ":8080"
+      BROADCAST_INTERVAL_MS: "1000"
+      MAX_VEHICLES_ON_MAP: "1500"
+      SCYLLA_HOSTS: "scylla:9042"
+      HISTORY_WINDOW_MS: "2000"
+      HISTORY_MAX_AGE_SECONDS: "1800"
+      HISTORY_ROWS_PER_ZONE: "2000"
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
   # --- Faz 17: log toplama ---
   #
   # Metrikler "ne kadar", loglar "neden" sorusunu yanitlar. Faz 13'te uc Go

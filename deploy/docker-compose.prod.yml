@@ -9,6 +9,34 @@
 # - Grafana/Prometheus portlarını sadece Caddy üzerinden dışa açacak şekilde kısıtlar
 #   (doğrudan internete açık bırakmak yerine reverse proxy arkasına alır)
 # - Ortam değişkenlerini .env dosyasından okur (bkz. .env.example)
+#
+# --- BELLEK BÜTÇESİ (Faz 18'de yeniden hesaplandı) ---
+#
+# Faz 6'da bu profil t3.large (8GB) için boyutlandırılmıştı. Sonraki fazlarda
+# servis eklendi ama bütçe kimse tarafından yeniden hesaplanmadı:
+#   Faz 13 -> alertmanager + kafka-exporter
+#   Faz 17 -> loki + promtail
+# Toplam limit 8.38 GB'a çıkmıştı, yani hedef instance'ın TAMAMINDAN fazla —
+# işletim sistemine hiç pay kalmıyordu. Bu, kimsenin fark etmediği türden
+# sessiz bir bozulma: local'de kimse prod profilini çalıştırmadığı için
+# görünmüyordu.
+#
+#   kafka 1280M · scylla 2048M · producer 512M · consumer 2×512M
+#   prometheus 512M · grafana 512M · alertmanager 128M · kafka-exporter 128M
+#   loki 512M · promtail 128M · webviz 512M · caddy 128M
+#   ------------------------------------------------------------------
+#   TOPLAM 7.25 GB   (t3.large 8GB · işletim sistemine ~0.75GB pay)
+#
+# 0.75GB pay Ubuntu + Docker daemon için yeterli ama BOL DEĞİL. Bu bir
+# HESAP, ölçüm değil: limitler tavandır, gerçek kullanım genelde altında
+# kalır. Gerçek sunucuda `docker stats` ile doğrulanmalı; sıkışıklık
+# görülürse ilk kısılacak yer Grafana ve Prometheus (ikisi de demo
+# yükünde limitlerinin çok altında çalışır).
+#
+# scylla'nın limiti (2G) ile --memory bayrağı (1500M) artık tutarlı; önceki
+# sürümde limit 2.5G, bayrak 2000M idi ve ikisi de bütçeyi şişiriyordu.
+#
+# 3 consumer replikası ya da Faz 3 benchmark'ı koşulacaksa t3.xlarge gerekir.
 
 services:
   kafka:
@@ -17,16 +45,16 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 1.5G
+          memory: 1280M
 
   scylla:
     restart: unless-stopped
-    command: --smp 2 --memory 2000M --overprovisioned 1 --api-address 0.0.0.0
+    command: --smp 2 --memory 1500M --overprovisioned 1 --api-address 0.0.0.0
     deploy:
       resources:
         limits:
           cpus: "1.5"
-          memory: 2.5G
+          memory: 2G
 
   producer:
     restart: unless-stopped
@@ -47,7 +75,11 @@ services:
   consumer:
     restart: unless-stopped
     deploy:
-      replicas: 3          # Faz 3'teki paralel consumer stratejisi production'da kalıcı
+      # Faz 3'ten Faz 18'e kadar 3 replikaydı; bellek bütçesi yeniden
+      # hesaplanınca 2'ye indirildi (yukarıdaki tabloya bkz.). Yatay ölçekleme
+      # ve zone-başına-tek-replika hikâyesi 2 replikayla da kanıtlanıyor.
+      # 3 replika ya da Faz 3 benchmark'ı için t3.xlarge gerekir.
+      replicas: 2
       resources:
         limits:
           cpus: "0.5"
@@ -145,8 +177,15 @@ services:
       - "443:443"
       - "443:443/udp"  # HTTP/3
     environment:
-      PULSECITY_DOMAIN: "${PULSECITY_DOMAIN}"
-      ACME_EMAIL: "${ACME_EMAIL}"
+      # `:-` compose'da hem TANIMSIZ hem de BOŞ değeri yakalar. Bu ayrım
+      # kritik: Caddy'nin kendi `{$VAR:default}` sözdizimi yalnızca TANIMSIZ
+      # değişkende varsayılanı kullanır, tanımlı-ama-boş olanda boş değeri
+      # alır. .env dosyasında `PULSECITY_DOMAIN=` satırı (domain'siz kurulum)
+      # tam olarak bu duruma düşüyordu ve Caddy hiç başlamıyordu:
+      #   "server block without any key is global configuration..."
+      # Boş bir site adresi Caddyfile'da global options bloğu gibi okunuyor.
+      PULSECITY_DOMAIN: "${PULSECITY_DOMAIN:-:80}"
+      ACME_EMAIL: "${ACME_EMAIL:-admin@example.invalid}"
       # Test ederken staging'e almak için (bkz. Caddyfile):
       # ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory
       ACME_CA: "${ACME_CA:-https://acme-v02.api.letsencrypt.org/directory}"
@@ -162,6 +201,11 @@ services:
     depends_on:
       - grafana
       - webviz
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
 
 volumes:
   caddy-data:

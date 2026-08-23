@@ -47,7 +47,37 @@
 	}
 
 	handle {
-		reverse_proxy webviz:8080
+		# --- Blue-green (Faz 18) ---
+		#
+		# İki upstream birden tanımlı ama `lb_policy first` her zaman
+		# SIRADAKİ İLK SAĞLIKLI upstream'i seçer. Yani:
+		#
+		#   ikisi de ayakta  -> trafik webviz'de (blue)
+		#   blue durdurulur  -> trafik webviz-green'e geçer
+		#   blue geri gelir  -> trafik blue'ya döner (rollback)
+		#
+		# Geçiş böylece bir KONTEYNER İŞLEMİ oluyor; Caddy yapılandırması
+		# değişmiyor, reload gerekmiyor, üretilen bir dosya yok. Sağlık
+		# kontrolü `/readyz`e vurduğu için yeni sürüm hazır olmadan trafik
+		# almıyor — Faz 12'de eklenen readiness sondası burada ikinci kez
+		# işe yarıyor.
+		#
+		# webviz-green normalde ÇALIŞMAZ (compose profili arkasında); yalnızca
+		# deploy sırasında ayağa kalkar. Bu yüzden Caddy onu sürekli
+		# "unhealthy" görür ve loglar — beklenen durum.
+		reverse_proxy webviz:8080 webviz-green:8080 {
+			lb_policy first
+
+			health_uri /readyz
+			health_interval 3s
+			health_timeout 2s
+			health_status 200
+
+			# Bir upstream cevap vermezse diğerini dene: geçiş anında
+			# uçuşta olan istekler düşmesin.
+			lb_try_duration 5s
+			lb_try_interval 250ms
+		}
 	}
 
 	# --- Güvenlik başlıkları ---
