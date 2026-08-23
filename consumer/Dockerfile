@@ -1,7 +1,7 @@
 # Base imajlar hem etiket hem digest ile sabitlenir - gerekce icin
 # bkz. producer/Dockerfile. Digest guncellemesi .github/dependabot.yml ile
 # haftalik PR olarak gelir.
-FROM golang:1.26-alpine@sha256:28d89ee9cc0ff9fec75c82ca201e6bf7fdf9a679d4b7b24dfa04f2bb766bb468 AS build
+FROM golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS build
 WORKDIR /app
 # Bagimliliklar once kopyalanir: kod degistiginde bu katman onbellekten gelir,
 # modul indirme her build'de tekrarlanmaz. Ayrica go.sum sayesinde build
@@ -11,7 +11,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /consumer .
 
-FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 # Ayricaliksiz kullanici, sabit UID (Kubernetes runAsNonRoot icin sayisal deger
 # gerekir). Bkz. producer/Dockerfile.
