@@ -61,3 +61,17 @@ resource "aws_route_table_association" "public" {
   subnet_id      = aws_subnet.public.id
   route_table_id = aws_route_table.public.id
 }
+
+# Degiskenler arasi tutarlilik kontrolu.
+#
+# Terraform'un `validation` bloklari yalnizca TEK bir degiskene bakabilir;
+# "domain verildiyse acme_email de zorunlu" gibi capraz bir kural orada
+# ifade edilemez. `check` blogu (Terraform 1.5+) bunu plan asamasinda uyari
+# olarak yakalar - apply'dan sonra Caddy'nin sertifika alamamasini beklemek
+# yerine.
+check "acme_email_required_with_domain" {
+  assert {
+    condition     = var.domain == "" || var.acme_email != ""
+    error_message = "domain verildiginde acme_email de verilmelidir - Let's Encrypt hesabi bir iletisim adresi ister."
+  }
+}

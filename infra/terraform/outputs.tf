@@ -1,3 +1,10 @@
+# Dis adres: domain verildiyse HTTPS, verilmediyse IP uzerinden HTTP.
+# Caddy alan adi gordugunde otomatik olarak sertifika alip HTTP'yi
+# yonlendirir (bkz. deploy/Caddyfile).
+locals {
+  external_url = var.domain == "" ? "http://${aws_eip.app.public_ip}" : "https://${var.domain}"
+}
+
 output "public_ip" {
   description = "Sunucunun sabit (Elastic) IP adresi."
   value       = aws_eip.app.public_ip
@@ -10,17 +17,22 @@ output "ssh_command" {
 
 output "map_url" {
   description = "Canli harita adresi."
-  value       = "http://${aws_eip.app.public_ip}/"
+  value       = "${local.external_url}/"
 }
 
 output "grafana_url" {
   description = "Grafana adresi."
-  value       = "http://${aws_eip.app.public_ip}/grafana/"
+  value       = "${local.external_url}/grafana/"
 }
 
 output "tunnel_command" {
   description = "Disa acilmayan arayuzler (Prometheus, Alertmanager) icin SSH tuneli."
   value       = "ssh -L 9090:localhost:9090 -L 9093:localhost:9093 ubuntu@${aws_eip.app.public_ip}"
+}
+
+output "dns_record_required" {
+  description = "Alan adinin isaret etmesi gereken kayit. DuckDNS token'i verildiyse cloud-init bunu otomatik gunceller."
+  value       = var.domain == "" ? "(alan adi verilmedi - TLS devre disi)" : "${var.domain}  A  ${aws_eip.app.public_ip}"
 }
 
 output "grafana_admin_password_ssm_path" {

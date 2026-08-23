@@ -114,14 +114,36 @@ services:
           cpus: "0.5"
           memory: 512M
 
-  nginx:
-    image: nginx:1.27-alpine
-    container_name: pulsecity-nginx
+  # Faz 16: Nginx'in yerini Caddy aldı — otomatik TLS için.
+  # Nginx yapılandırması deploy/nginx.conf'ta duruyor (TLS'siz kurulum ya da
+  # Caddy'nin uygun olmadığı bir ortam için referans).
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: pulsecity-caddy
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "80:80"     # ACME HTTP-01 doğrulaması + HTTPS'e yönlendirme
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    environment:
+      PULSECITY_DOMAIN: "${PULSECITY_DOMAIN}"
+      ACME_EMAIL: "${ACME_EMAIL}"
+      # Test ederken staging'e almak için (bkz. Caddyfile):
+      # ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory
+      ACME_CA: "${ACME_CA:-https://acme-v02.api.letsencrypt.org/directory}"
     volumes:
-      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # SERTİFİKA KALICILIĞI — atlanırsa Let's Encrypt limitine takılırsın.
+      # Caddy sertifikayı ve ACME hesap anahtarını /data altında tutar. Bu
+      # volume olmadan her `docker compose up --build` sertifikayı SIFIRDAN
+      # ister; "aynı sertifika" için haftada 5 istek sınırı vardır ve birkaç
+      # deploy sonrası hafta boyu kilitlenirsin.
+      - caddy-data:/data
+      - caddy-config:/config
     depends_on:
       - grafana
       - webviz
+
+volumes:
+  caddy-data:
+  caddy-config:

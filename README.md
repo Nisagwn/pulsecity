@@ -47,7 +47,7 @@ izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
 ├── monitoring/              # Prometheus config + alarm kuralları, Alertmanager,
 │                            # Grafana provisioning/dashboard
 ├── scripts/                 # zero-loss testi, benchmark, chaos testing scriptleri
-├── deploy/                  # Production/CI compose override, Nginx, VPS deployment rehberi
+├── deploy/                  # Production/CI compose override, Caddy (TLS), Nginx, VPS rehberi
 ├── infra/terraform/         # Altyapı kod olarak: VPC, EC2, IAM, SSM (Faz 14)
 └── .github/workflows/       # CI/CD (lint, test, uçtan uca test, imaj yayınlama)
 ```
@@ -552,6 +552,65 @@ iki yönde test edildi (temiz depoda susuyor, gerçek anahtar eklenince yakalıy
 `amtool check-config` prod yapılandırmasında başarılı · `terraform validate` başarılı ·
 GitHub Push Protection tetiklendi ve düzgün biçimde çözüldü.
 
+### Faz 16 — TLS (Caddy) ✅
+README'nin "bilinen sınırlamalar" listesinde Faz 6'dan beri duran madde:
+*"TLS/HTTPS henüz yok."* Bu faz onu kapatır — ve Nginx'i Caddy ile değiştirir.
+
+**Neden Nginx değil Caddy.** Nginx ile aynı sonucu almak için certbot +
+yenileme zamanlayıcısı + yenileme sonrası reload kancası + TLS blokları
+gerekirdi: dört ayrı hareketli parça, her biri sessizce bozulabilen ve
+bozulduğu gün sertifika süresi dolana kadar fark edilmeyen. Caddy sertifikayı
+kendisi alır, kendisi yeniler, HTTP'yi HTTPS'e kendisi yönlendirir.
+Yapılandırma da belirgin biçimde kısaldı: Nginx'te WebSocket için ayrı bir
+`location /ws` bloğu ve `Upgrade`/`Connection` başlıklarını elle set etmek
+gerekiyordu — unutulduğunda harita sürekli yeniden bağlanıyordu. Caddy'nin
+`reverse_proxy`'si bunu kendiliğinden yapar.
+
+`deploy/nginx.conf` silinmedi; TLS'siz bir kurulum ya da Caddy'nin uygun
+olmadığı bir ortam için referans olarak duruyor.
+
+**Alan adı isteğe bağlı, TLS kendiliğinden devreye giriyor.** Caddyfile'ın site
+adresi `{$PULSECITY_DOMAIN::80}` — alan adı verilmezse `:80`e düşer, yani eski
+Nginx davranışının aynısı. Alan adı tanımlandığı anda Caddy otomatik olarak
+sertifika alır ve HTTP'yi yönlendirir. Bu, kurulumu iki farklı yola bölmeden
+"domain'i olmayan da çalışsın" gereksinimini karşılıyor.
+
+**Sertifika kalıcılığı atlanabilecek bir tuzak.** Caddy sertifikayı ve ACME
+hesap anahtarını `/data` altında tutar. Named volume olmadan her
+`docker compose up --build` sertifikayı **sıfırdan** ister; Let's Encrypt'in
+"aynı sertifika" limiti haftada 5'tir ve birkaç deploy sonrası hafta boyu
+kilitlenirsin — geri dönüşü yok, beklemek zorundasın. `caddy-data` ve
+`caddy-config` volume'leri bunun için. Aynı sebeple Caddyfile'da `acme_ca`
+ortam değişkeninden okunuyor: test ederken staging'e alınabiliyor.
+
+**DNS adımı da otomatik.** DuckDNS token'ı SOPS ile şifrelenip depoda duruyor;
+cloud-init açılışta A kaydını sunucunun IP'sine yönlendiriyor. Elastic IP
+sabit olduğu için bu aslında tek seferlik, ama EIP kullanılmayan bir kurulumda
+her açılışta gerekli hale gelir. Faz 15'in altyapısı burada ikinci kez işe
+yaradı.
+
+**Terraform'da değişkenler arası kontrol.** `domain` verilip `acme_email`
+verilmezse Caddy sertifika alamaz. Terraform'un `validation` blokları yalnızca
+tek bir değişkene bakabildiği için bu çapraz kural orada ifade edilemiyor;
+`check` bloğu (Terraform 1.5+) bunu **plan aşamasında** yakalıyor — `apply`'dan
+sonra sertifikanın gelmemesini beklemek yerine.
+
+**Güvenlik başlıkları** eklendi: HSTS (1 yıl), `X-Content-Type-Options`,
+`X-Frame-Options`, `Referrer-Policy`, ve `Server` başlığının kaldırılması.
+Erişim logları JSON — Faz 13'te uygulama loglarını yapılandırmıştık, reverse
+proxy de aynı biçimde konuşsun ki tek bir log toplama hattı hepsini aynı
+şekilde işleyebilsin.
+
+**Ölçülen sonuçlar:** `caddy validate` iki modda da başarılı (alan adsız →
+*"listening only on the HTTP port"*; alan adıyla → *"enabling automatic
+HTTP→HTTPS redirects"*) · yönlendirme sahte backend'lerle uçtan uca test edildi
+(`/` → webviz, `/grafana/` → grafana) · güvenlik başlıkları yanıtta doğrulandı,
+`Server` başlığı kaldırılmış · `terraform validate` ve `trivy config` temiz.
+
+> HSTS'in bir yan etkisi var: tarayıcı bir kez aldıktan sonra o alan adına
+> HTTP ile gitmeyi bir yıl boyunca reddeder. HTTPS'ten geri dönmen gerekirse
+> önce `max-age=0` yayınlaman gerekir.
+
 ## Sonuçları doğrulama sırası
 
 Projeyi baştan sona kendi ortamında doğrulamak istersen:
@@ -585,7 +644,6 @@ docker compose logs -f producer consumer
 - Multi-region / multi-datacenter dağıtım yok
 - Kubernetes yok (bu ölçekte overkill; Docker Compose + tek VPS yeterli)
 - Karmaşık stream-processing (windowing, join, CEP) yok — ayrı bir proje fikri olarak değerlendirildi
-- TLS/HTTPS henüz yok (Faz 6'da not edildi, gerçek domain ile kolayca eklenebilir)
 - Kafka/ScyllaDB tek node (RF=1) — production-grade bir kurulumda RF=3 + multi-broker gerekir
 - `ping_time` milisaniye hassasiyetinde saklanır; aynı aracın aynı milisaniyedeki iki
   ping'i tek satıra iner (~%7). Boru hattı bunları kaybetmez (Kafka'da ve DLQ hesabında

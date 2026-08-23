@@ -86,12 +86,39 @@ write_files:
           -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'
       )" http://169.254.169.254/latest/meta-data/public-ipv4)"
 
-      # .env dosyasi calisma zamaninda uretiliyor, depoda tutulmuyor.
+      # --- DuckDNS A kaydini bu sunucuya yonlendir (Faz 16) ---
+      #
+      # Token SOPS ile cozulmus dosyadan geliyor. Elastic IP sabit oldugu icin
+      # bu aslinda tek seferlik, ama her acilista kosmasi zararsiz ve EIP
+      # kullanilmayan bir kurulumda gerekli hale gelir.
+      DUCK_TOKEN_FILE="$APP_DIR/secrets/decrypted/duckdns_token"
+      if [ -n "${domain}" ] && [ -f "$DUCK_TOKEN_FILE" ]; then
+        DUCK_SUB="$(echo '${domain}' | cut -d. -f1)"
+        DUCK_TOKEN="$(tr -d '[:space:]' < "$DUCK_TOKEN_FILE")"
+        RESP="$(curl -s "https://www.duckdns.org/update?domains=$DUCK_SUB&token=$DUCK_TOKEN&ip=$PUBLIC_IP" || true)"
+        echo "duckdns guncelleme: $RESP"
+      fi
+
+      # --- .env ---
+      #
+      # Calisma zamaninda uretiliyor, depoda tutulmuyor.
+      #
+      # domain verildiyse dis adres HTTPS: Grafana'nin root_url'i de https
+      # olmali, aksi halde Grafana kendi uygulama ici baglantilarini http
+      # olarak uretir ve tarayici karma icerik uyarisi verir.
+      if [ -n "${domain}" ]; then
+        EXTERNAL_URL="https://${domain}"
+      else
+        EXTERNAL_URL="http://$PUBLIC_IP"
+      fi
+
       umask 077
       cat > "$APP_DIR/.env" <<ENVFILE
       GRAFANA_ADMIN_USER=admin
       GRAFANA_ADMIN_PASSWORD=$GRAFANA_PASSWORD
-      GRAFANA_ROOT_URL=http://$PUBLIC_IP/grafana/
+      GRAFANA_ROOT_URL=$EXTERNAL_URL/grafana/
+      PULSECITY_DOMAIN=${domain}
+      ACME_EMAIL=${acme_email}
       ENVFILE
 
       docker compose \

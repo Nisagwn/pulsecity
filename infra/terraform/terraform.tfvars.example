@@ -34,3 +34,20 @@ ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... kullanici@makine"
 # Harita ve Grafana herkese acik bir demo oldugu icin varsayilan tum internet.
 # Yalnizca kendine acmak istersen buraya da kendi /32'ni yaz.
 # allowed_http_cidr = "0.0.0.0/0"
+
+# --- TLS (Faz 16) ----------------------------------------------------------
+
+# Alan adi. Bos birakilirsa TLS devre disi kalir ve sistem yalnizca IP
+# uzerinden HTTP ile servis edilir (Let's Encrypt IP'ye sertifika vermez).
+# A kaydi bu sunucunun Elastic IP'sine isaret etmeli - DuckDNS kullaniyorsan
+# secrets/duckdns_token.enc doldurulursa cloud-init otomatik gunceller.
+domain = "nisagvn.duckdns.org"
+
+# Let's Encrypt hesabi icin iletisim adresi. domain verildiyse ZORUNLU.
+acme_email = "sen@ornek.com"
+
+# --- SOPS (Faz 15) ---------------------------------------------------------
+
+# age OZEL anahtari. Bos birakilirsa SOPS akisi devre disi kalir.
+#   grep AGE-SECRET-KEY ~/.config/sops/age/keys.txt
+# age_private_key = "AGE-SECRET-KEY-1..."
