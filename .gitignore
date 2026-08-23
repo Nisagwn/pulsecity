@@ -25,3 +25,23 @@ desktop.ini
 
 # Claude Code yerel arac yapilandirmasi (projeye ait degil)
 .claude/
+
+# --- Terraform (Faz 14) ---
+# tfstate ACIK METIN olarak hassas veri icerir: bu projede SSM parametre
+# degerleri ve uretilen Grafana parolasi. Asla commit edilmemeli.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+crash.*.log
+
+# NOT: .terraform.lock.hcl BILEREK ignore EDILMIYOR - o dosya go.sum'in
+# karsiligidir, provider surumlerini ve saglama toplamlarini sabitler.
+# Ignore edilirse her makinede farkli bir provider surumu cozulebilir ve
+# "tekrarlanabilir build" iddiasi Terraform tarafinda kirilir.
+
+# Gercek degiskenler (IP adresi, SSH acik anahtari). Sablon:
+# infra/terraform/terraform.tfvars.example
+*.tfvars
+*.tfvars.json
+!*.tfvars.example

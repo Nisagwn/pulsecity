@@ -44,9 +44,11 @@ izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
 ├── webviz/                  # Go WebSocket servisi + Leaflet canlı harita (Faz 9)
 │                            # + ScyllaDB'den geçmişe bakma (Faz 11)
 ├── scylla-init/schema.cql   # ScyllaDB şema tanımı
-├── monitoring/              # Prometheus config + Grafana provisioning/dashboard
+├── monitoring/              # Prometheus config + alarm kuralları, Alertmanager,
+│                            # Grafana provisioning/dashboard
 ├── scripts/                 # zero-loss testi, benchmark, chaos testing scriptleri
 ├── deploy/                  # Production/CI compose override, Nginx, VPS deployment rehberi
+├── infra/terraform/         # Altyapı kod olarak: VPC, EC2, IAM, SSM (Faz 14)
 └── .github/workflows/       # CI/CD (lint, test, uçtan uca test, imaj yayınlama)
 ```
 
@@ -420,6 +422,60 @@ güvenle uygulanabiliyor.
 **Hâlâ eksik olan:** IaC (Terraform — `deploy/DEPLOY.md` hâlâ elle SSH adımları),
 secret yönetimi (`.env` seviyesinde, SOPS/Vault yok), TLS, log toplama
 (Loki/Promtail), ve çifte-hata anında commit etmeme davranışının birim testi.
+
+### Faz 14 — Altyapı Kod Olarak (Terraform) ✅
+Faz 13'e kadar `deploy/DEPLOY.md` bir **runbook**'tu: SSH ile bağlan, `apt
+install` yap, `.env`'i `nano` ile doldur. Elle uygulanan adımlar her seferinde
+biraz farklı uygulanır ve "sunucuda ne olduğunu" kimse tam bilemez. Bu faz
+sunucuyu *onarılan* bir şey olmaktan çıkarıp **yeniden üretilen** bir şey
+yapar.
+
+`infra/terraform/` — VPC + public subnet + IGW, Security Group, EC2
+(gp3 + EBS şifreleme), Elastic IP, SSM Parameter, IAM rolü, VPC Flow Logs.
+Sunucu hazırlığı `cloud-init.yaml` ile.
+
+**Secret'lar `user_data`'ya gömülmüyor.** En kolay yol Grafana parolasını
+cloud-init içine yazmaktı, ama EC2 user-data gizli bir kanal değildir:
+instance üzerindeki herhangi bir süreç IMDS'ten okuyabilir
+(`curl http://169.254.169.254/latest/user-data`), AWS konsolunda düz metin
+görünür ve Terraform state'ine de düz metin yazılır. Parola bunun yerine SSM'de
+**SecureString** olarak durur; instance onu *kendi* IAM kimliğiyle, yalnızca o
+tek parametre yoluna erişim veren bir politikayla çeker. Parola makineye
+gönderilmiyor — makine onu yetkisi olduğu için okuyor.
+
+**IMDSv2 zorunlu, `hop_limit = 1`.** IMDSv1'de metadata servisi kimlik
+doğrulamasız bir GET ile okunur; uygulamada bir SSRF açığı varsa saldırgan
+instance rolünün geçici kimlik bilgilerini sızdırabilir — gerçek ihlallerde
+defalarca kullanılmış bir zincir. `hop_limit = 1` ayrıca konteyner ağ
+katmanından IMDS'e erişimi keser.
+
+**`allowed_ssh_cidr`'ın varsayılanı yok.** En güvenli değeri bile varsayılan
+yapmak, bu alanı "düşünülmesi gerekmeyen" bir alan haline getirir. Zorunlu
+bırakmak her `apply`'da bilinçli bir karar dayatıyor; `0.0.0.0/0` verilmesi
+`validation` bloğuyla reddediliyor.
+
+**Taramanın bulduğu ve nasıl davranıldığı.** Terraform'a da imajlara
+uyguladığım kapının aynısını uyguladım (`trivy config`). İki bulgu çıktı ve
+ikisine farklı davranıldı:
+
+| Bulgu | Karar |
+|---|---|
+| `AWS-0178` (MEDIUM) — VPC Flow Logs yok | **Düzeltildi.** Haklı bir bulguydu: proje baştan sona gözlemlenebilirlik üzerine kurulu ama ağ katmanı görünmezdi. 7 gün saklama ile eklendi |
+| `AWS-0104` (CRITICAL) — sınırsız egress | **Gerekçesiyle kabul edildi.** Docker Hub/GHCR/apt/Let's Encrypt CDN arkasında ve değişken IP aralıklarında; daraltmak ya kırılgan bir liste ya da ~35 USD/ay NAT + egress proxy gerektirir. `security.tf` içinde `trivy:ignore` ile **yazılı olarak** işaretlendi |
+
+İkinci satır bilinçli: bir bulguyu *sessizce bastırmak* ile *yazılı olarak
+kabul etmek* arasındaki fark, "farkında değil" ile "farkında ve karar verdi"
+arasındaki farktır.
+
+**CI'da `apply` yok, bilerek.** `iac` job'ı her push'ta `fmt -check`,
+`validate` ve Trivy taraması çalıştırır — ama `plan`/`apply` çalıştırmaz, yani
+iş akışının bulut kimlik bilgisi tutması gerekmez. Uygulamayı operatör kendi
+kimliğiyle yapar.
+
+**Ölçülen sonuçlar:** `terraform fmt -check` temiz · `terraform validate`
+başarılı · `trivy config` **0 bulgu** (bir istisna gerekçeli).
+
+Ayrıntı ve maliyet notları: [`infra/terraform/README.md`](infra/terraform/README.md).
 
 ## Sonuçları doğrulama sırası
 

@@ -1,0 +1,110 @@
+#cloud-config
+# PulseCity sunucu hazirligi.
+#
+# Bu dosya deploy/DEPLOY.md'nin 1-4. adimlarinin (Docker kurulumu, kullanici
+# gruplari, depo, .env, ayaga kaldirma) koda dokulmus halidir. Rehber hala
+# okunmaya deger - ne yapildigini anlatir - ama artik YAPAN o degil.
+#
+# Fark su: elle SSH adimlari her seferinde biraz farkli uygulanir ve
+# "sunucuda ne oldugunu" kimse tam bilemez. cloud-init her instance'ta ayni
+# sirayla, ayni sekilde calisir; sunucu artik onarilan degil, YENIDEN
+# URETILEN bir sey.
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - jq
+  - unzip
+  - awscli
+
+write_files:
+  # Docker'in resmi deposu. Ubuntu'nun kendi docker.io paketi genelde eski ve
+  # `docker compose` (v2 plugin) icermez.
+  - path: /etc/apt/keyrings/.keep
+    content: ""
+
+  # Ayaga kaldirma betigi. runcmd icine gomulmedi ki SSH ile baglanip elle de
+  # calistirilabilsin (guncelleme akisi icin).
+  - path: /usr/local/bin/pulsecity-up
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      APP_DIR=/opt/${project_name}
+      cd "$APP_DIR"
+
+      # Grafana parolasi SSM'den, instance'in KENDI IAM rolüyle okunuyor.
+      # Deposunda ya da user-data'da duz metin olarak durmuyor.
+      GRAFANA_PASSWORD="$(aws ssm get-parameter \
+        --name '${grafana_ssm_path}' \
+        --with-decryption \
+        --region '${aws_region}' \
+        --query 'Parameter.Value' \
+        --output text)"
+
+      PUBLIC_IP="$(curl -s -H "X-aws-ec2-metadata-token: $(
+        curl -s -X PUT http://169.254.169.254/latest/api/token \
+          -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'
+      )" http://169.254.169.254/latest/meta-data/public-ipv4)"
+
+      # .env dosyasi calisma zamaninda uretiliyor, depoda tutulmuyor.
+      umask 077
+      cat > "$APP_DIR/.env" <<ENVFILE
+      GRAFANA_ADMIN_USER=admin
+      GRAFANA_ADMIN_PASSWORD=$GRAFANA_PASSWORD
+      GRAFANA_ROOT_URL=http://$PUBLIC_IP/grafana/
+      ENVFILE
+
+      docker compose \
+        -f docker-compose.yml \
+        -f deploy/docker-compose.prod.yml \
+        up -d --build
+
+runcmd:
+  # --- Docker (resmi depo) ---
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - |
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - usermod -aG docker ubuntu
+  - systemctl enable --now docker
+
+  # --- Depo ---
+  - git clone --branch ${repo_branch} --depth 1 ${repo_url} /opt/${project_name}
+  - chown -R ubuntu:ubuntu /opt/${project_name}
+
+  # --- Ayaga kaldir ---
+  - /usr/local/bin/pulsecity-up
+
+  # --- Yeniden baslatmada otomatik ayaga kalksin ---
+  # compose'daki `restart: unless-stopped` konteynerleri geri getirir, ancak
+  # .env icindeki public IP degismis olabilir (EIP varsa degismez, yoksa
+  # degisir). Bu unit .env'i her acilista yeniden uretir.
+  - |
+    cat > /etc/systemd/system/pulsecity.service <<'UNIT'
+    [Unit]
+    Description=PulseCity stack
+    Requires=docker.service
+    After=docker.service network-online.target
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/usr/local/bin/pulsecity-up
+
+    [Install]
+    WantedBy=multi-user.target
+    UNIT
+  - systemctl daemon-reload
+  - systemctl enable pulsecity.service
+
+final_message: "PulseCity hazir. Harita: http://$PUBLIC_IPV4/  Grafana: http://$PUBLIC_IPV4/grafana/"
