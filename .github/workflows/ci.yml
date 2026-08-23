@@ -184,7 +184,7 @@ jobs:
         run: docker build -t pulsecity-${{ matrix.module }}:scan ${{ matrix.module }}
 
       - name: Trivy — imaj açık taraması
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: pulsecity-${{ matrix.module }}:scan
           format: table
@@ -196,13 +196,17 @@ jobs:
       # exit-code YOK: burada amaç raporlamak, kırma kararını yukarıdaki adım verdi.
       - name: Trivy — SARIF üret
         if: always()
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: pulsecity-${{ matrix.module }}:scan
           format: sarif
           output: trivy-${{ matrix.module }}.sarif
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          # Trivy, SARIF ciktisinda `severity` filtresini VARSAYILAN OLARAK
+          # uygulamaz - bu bayrak olmadan Security sekmesine LOW/MEDIUM dahil
+          # her sey duser ve yukaridaki kapiyla tutarsiz bir liste olusur.
+          limit-severities-for-sarif: true
 
       - name: SARIF'i Security sekmesine yükle
         if: always()
@@ -217,7 +221,7 @@ jobs:
       # Dockerfile yanlış yapılandırmaları (root kullanıcı, sabitlenmemiş base
       # imaj, gereksiz ayrıcalık). Faz 13'te düzeltilen sınıfın regresyon kilidi.
       - name: Trivy — Dockerfile yapılandırma denetimi
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: ${{ matrix.module }}
