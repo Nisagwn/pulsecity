@@ -1,0 +1,36 @@
+# PulseCity — Terraform degiskenleri (sablon)
+#
+# Kullanim:
+#   cp terraform.tfvars.example terraform.tfvars
+#   # terraform.tfvars'i kendi degerlerinle doldur
+#
+# terraform.tfvars .gitignore'da - gercek degerler asla commit edilmez.
+
+# --- ZORUNLU ---------------------------------------------------------------
+
+# SSH'a izin verilen tek IP. Kendi adresini ogren:
+#   curl -s https://checkip.amazonaws.com
+# 0.0.0.0/0 vermek validation ile REDDEDILIR.
+allowed_ssh_cidr = "203.0.113.42/32"
+
+# Sunucuya yetkilendirilecek SSH ACIK anahtari (~/.ssh/id_ed25519.pub icerigi).
+# Ozel anahtari (uzantisiz dosya) ASLA buraya yazma.
+ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... kullanici@makine"
+
+# --- OPSIYONEL (varsayilanlar yeterli) -------------------------------------
+
+# aws_region = "eu-central-1"
+
+# Boyutlandirma (bkz. deploy/DEPLOY.md):
+#   t3.large  - sadece demo (varsayilan)
+#   t3.xlarge - benchmark de kosulacaksa
+# instance_type = "t3.large"
+
+# root_volume_size_gb = 30
+
+# repo_url    = "https://github.com/Nisagwn/pulsecity.git"
+# repo_branch = "main"
+
+# Harita ve Grafana herkese acik bir demo oldugu icin varsayilan tum internet.
+# Yalnizca kendine acmak istersen buraya da kendi /32'ni yaz.
+# allowed_http_cidr = "0.0.0.0/0"

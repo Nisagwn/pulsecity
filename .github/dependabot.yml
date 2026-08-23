@@ -2,33 +2,61 @@
 #
 # Bu dosya, Dockerfile'lardaki digest sabitlemesinin (pinning) karsi agirligidir.
 # Digest ile sabitlemek build'i tekrarlanabilir yapar ama base imaj guvenlik
-# yamalarinin otomatik akisini keser: `alpine:3.19` etiketi yeni bir yama
+# yamalarinin otomatik akisini keser: `alpine:3.22` etiketi yeni bir yama
 # aldiginda digest'e sabitlenmis build eski katmanda kalir.
 #
 # Dependabot digest'leri haftalik olarak tarar ve degisiklik varsa PR acar.
 # Boylece yama akisi kaybolmaz, sadece OTOMATIK olmaktan cikip GOZDEN
 # GECIRILEBILIR hale gelir - CI (lint/test/integration + Trivy taramasi) her
 # PR'da kostugu icin guncelleme korumasiz birlesmez.
+#
+# --- GRUPLAMA NEDEN VAR ---
+#
+# Ilk surumde `groups` ve `open-pull-requests-limit` yoktu. Sonuc: Dependabot
+# etkinlestigi anda 7 ekosistemi birden tarayip HER BAGIMLILIK ICIN AYRI bir PR
+# acti - tek seferde 20 PR. Teknik olarak dogru ama pratikte kullanilamaz:
+# 20 ayri CI kosusu, 20 ayri inceleme, ve gercekten onemli olan guvenlik
+# guncellemesi digerlerinin arasinda kaybolur.
+#
+# Simdi minor/patch guncellemeleri ekosistem basina TEK PR'da toplaniyor.
+# MAJOR guncellemeler bilerek gruplanmiyor: kirici degisiklik ihtimali
+# tasidiklari icin tek tek incelenmeleri gerekir (ornegin
+# actions/upload-artifact v4 -> v7 girdi adlarini degistirebilir).
 
 version: 2
 updates:
-  # --- Base imajlar (digest guncellemeleri) ---
+  # --- Base imajlar (digest ve surum guncellemeleri) ---
   - package-ecosystem: "docker"
     directory: "/producer"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      base-images:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     labels: ["dependencies", "docker"]
 
   - package-ecosystem: "docker"
     directory: "/consumer"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      base-images:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     labels: ["dependencies", "docker"]
 
   - package-ecosystem: "docker"
     directory: "/webviz"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      base-images:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     labels: ["dependencies", "docker"]
 
   # --- Go modulleri ---
@@ -37,18 +65,33 @@ updates:
     directory: "/producer"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     labels: ["dependencies", "go"]
 
   - package-ecosystem: "gomod"
     directory: "/consumer"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     labels: ["dependencies", "go"]
 
   - package-ecosystem: "gomod"
     directory: "/webviz"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     labels: ["dependencies", "go"]
 
   # --- GitHub Actions ---
@@ -58,4 +101,22 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     labels: ["dependencies", "ci"]
+
+  # --- Terraform (Faz 14) ---
+  # versions.tf'teki provider kisitlari ve .terraform.lock.hcl icin.
+  - package-ecosystem: "terraform"
+    directory: "/infra/terraform"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      terraform-providers:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    labels: ["dependencies", "terraform"]

@@ -246,7 +246,76 @@ jobs:
           path: sbom-${{ matrix.module }}.spdx.json
           retention-days: 90
 
-  # --- 5) İmajları GHCR'a gönder ------------------------------------------
+  # --- 5) IaC: Terraform doğrulama + güvenlik taraması ---------------------
+  #
+  # `apply` YOK ve bilinçli olarak yok: bu iş akışının bulut kimlik bilgisi
+  # tutması gerekmez. Buradaki amaç, altyapı kodunun biçimli, geçerli ve
+  # yanlış yapılandırma içermediğini her push'ta kanıtlamak.
+  #
+  # `terraform plan` da yok — plan gerçek state ve kimlik bilgisi ister;
+  # onu çalıştıran taraf operatörün kendisi (bkz. infra/terraform/README.md).
+  iac:
+    name: Terraform doğrula & tara
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      # -backend=false: state arka ucunu başlatmadan yalnızca provider'ları
+      # indirir. validate için yeterli, kimlik bilgisi gerektirmez.
+      - name: terraform init
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      # Yanlış yapılandırma taraması: açık security group, şifresiz disk,
+      # IMDSv1, aşırı geniş IAM politikası gibi sınıflar.
+      #
+      # Kabul edilmiş istisnalar kodda `# trivy:ignore:<ID>` ile ve GEREKÇESİYLE
+      # işaretlenir (bkz. security.tf AWS-0104). Bir istisnayı sessizce
+      # bastırmakla, yazılı olarak kabul etmek arasındaki fark bu.
+      - name: Trivy — Terraform yapılandırma denetimi
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/terraform
+          format: table
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: "1"
+
+      - name: Trivy — SARIF üret
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/terraform
+          format: sarif
+          output: trivy-terraform.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          limit-severities-for-sarif: true
+
+      - name: SARIF'i Security sekmesine yükle
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: infra/terraform/trivy-terraform.sarif
+          category: trivy-terraform
+
+  # --- 6) İmajları GHCR'a gönder ------------------------------------------
   docker-push:
     name: İmaj yayınla (${{ matrix.module }})
     runs-on: ubuntu-latest
@@ -296,7 +365,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # --- 6) VPS'e dağıtım (henüz pasif) -------------------------------------
+  # --- 7) VPS'e dağıtım (henüz pasif) -------------------------------------
   #
   # Canlıya alma bilinçli olarak sonraya bırakıldı. Bu job iki koşul birden
   # saglanmadan ÇALIŞMAZ:
