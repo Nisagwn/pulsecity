@@ -23,6 +23,12 @@ services:
       KAFKA_NUM_NETWORK_THREADS: 8
       KAFKA_NUM_IO_THREADS: 8
       KAFKA_NUM_PARTITIONS: 12
+    volumes:
+      # KRaft metadata + log segmentleri. Volume OLMADAN bu veri container'in
+      # yazilabilir katmaninda durur: `docker compose down`, bir recreate ya da
+      # imaj guncellemesi topic'leri ve commit edilmis offset'leri sessizce
+      # siler. Consumer group offset'i sifirlanmasi zero-loss zincirini kirar.
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 10s
@@ -36,12 +42,40 @@ services:
       kafka:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
-    command: |
-      "
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic vehicle-pings --partitions 12 --replication-factor 1
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic vehicle-pings-dlq --partitions 3 --replication-factor 1
-      echo 'Topicler olusturuldu.'
-      "
+    # Retention politikasi bilerek acik yaziliyor. Broker varsayilani 7 GUN ve
+    # sinirsiz boyut: 50k msg/sn * ~200 bayt = ~10 MB/sn, yani saatte ~36 GB.
+    # Kalici volume eklendikten (Faz 12) sonra bu, diski dolduran bir kurulum
+    # demek olurdu.
+    #
+    # retention.bytes PARTITION BASINA uygulanir: 512 MiB * 12 partition = ~6 GiB tavan.
+    #
+    # segment.bytes de kucultuldu (varsayilan 1 GiB): Kafka yalnizca KAPANMIS
+    # segmentleri silebilir. 1 GiB'lik segmentlerle 512 MiB'lik bir retention
+    # tavani asla devreye giremezdi - aktif segment hicbir zaman kapanmaz ve
+    # politika sessizce etkisiz kalirdi.
+    #
+    # DLQ'nun retention'i UZUN (7 gun): orada duran mesajlar incelenmek icin
+    # var, hacmi de dusuk. Ana topic ile ayni politikayi uygulamak, hata
+    # ayiklanacak kaniti bir saat sonra silmek olurdu.
+    # DIKKAT: buradaki komutlar TEK SATIR olmali. Ters bolu (\) ile satir
+    # devami kullanilirsa compose bu blogu isleerken ters bolulari yutuyor ve
+    # `--config ...` ayri bir komut olarak calistirilmaya calisiliyor
+    # ("--config: command not found"). Topic yine olusur, ama retention
+    # politikasi SESSIZCE uygulanmaz - bu yuzden asagida ayrica dogrulaniyor.
+    #
+    # Olusturma ve yapilandirma bilerek AYRI adimlar: `--create --if-not-exists`
+    # zaten var olan bir topic'e --config uygulamaz. `--alter` ise her calisan
+    # kurulumda politikayi yeniden dayatir, yani bu dosya mevcut bir kuruluma
+    # da guvenle uygulanabilir.
+    command:
+      - |
+        set -e
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic vehicle-pings --partitions 12 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic vehicle-pings-dlq --partitions 3 --replication-factor 1
+        kafka-configs --bootstrap-server kafka:9092 --entity-type topics --entity-name vehicle-pings --alter --add-config retention.ms=3600000,retention.bytes=536870912,segment.bytes=134217728
+        kafka-configs --bootstrap-server kafka:9092 --entity-type topics --entity-name vehicle-pings-dlq --alter --add-config retention.ms=604800000
+        echo 'Topicler olusturuldu, retention politikasi uygulandi:'
+        kafka-configs --bootstrap-server kafka:9092 --entity-type topics --entity-name vehicle-pings --describe
 
   # --- ScyllaDB (tek node - local gelistirme icin, Faz 6'da cluster'a cikarilabilir) ---
   scylla:
@@ -50,6 +84,11 @@ services:
     ports:
       - "9042:9042"
     command: --smp 2 --memory 1500M --overprovisioned 1 --api-address 0.0.0.0
+    volumes:
+      # Ayni gerekce (bkz. kafka-data): volume olmadan yazilan her ping
+      # container'in omruyle sinirli kalir ve Faz 11'in gecmise bakma ozelligi
+      # her restart'ta bos veriyle baslar.
+      - scylla-data:/var/lib/scylla
     healthcheck:
       test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' || exit 1"]
       interval: 10s
@@ -96,6 +135,16 @@ services:
       # Bolgesel hiz verisini bilerek bozdugu icin prod'da ve benchmark
       # olcumlerinde KAPALI olmali (bkz. deploy/docker-compose.prod.yml).
       TEST_ANOMALY_DEMO: "true"
+    stop_grace_period: 15s
+    healthcheck:
+      # /readyz Kafka'ya son basarili yazmanin uzerinden ne kadar gectigine
+      # bakar: process ayakta ama broker'a yazamiyorsa restart policy devreye
+      # girer. Salt process kontrolu bu durumu goremezdi.
+      test: ["CMD", "wget", "-qO-", "http://localhost:2112/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   # --- Go Consumer ---
   # Birden fazla instance ile paralel tuketim icin:
@@ -116,6 +165,21 @@ services:
       SCYLLA_HOSTS: "scylla:9042"
       CONSUMER_BATCH_SIZE: "2000"
       METRICS_ADDR: ":2113"
+    # Docker'in varsayilan 10sn'lik SIGTERM->SIGKILL araligi, consumer'in son
+    # batch'i ScyllaDB'ye yazip offset'i commit etmesi icin (8sn butce) fazla
+    # dar. Sure yetmezse SIGKILL gelir ve batch commit edilmeden kalir - veri
+    # kaybi degil ama gereksiz bir reprocessing turu.
+    stop_grace_period: 20s
+    healthcheck:
+      # /readyz ScyllaDB session'ina gercek bir sorgu atar. connectWithRetry
+      # yalnizca ACILISTA calisiyor; baglanti calisma sirasinda koparsa consumer
+      # cokmeden her batch'i DLQ'ya yazmaya devam ederdi ve Docker bunu fark
+      # etmezdi. Asil bu senaryoyu yakalamak icin var.
+      test: ["CMD", "wget", "-qO-", "http://localhost:2113/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
 
   # --- Faz 9: Canli harita (WebSocket + Leaflet) ---
   # Kendi consumer group'unda calisir (pulsecity-webviz): ana consumer'in
@@ -144,6 +208,28 @@ services:
       HISTORY_WINDOW_MS: "2000"
       HISTORY_MAX_AGE_SECONDS: "1800"
       HISTORY_ROWS_PER_ZONE: "2000"
+    stop_grace_period: 15s
+    healthcheck:
+      # Scylla'ya BAKMAZ: gecmis okuma kritik yol degil, Scylla dusse bile
+      # canli harita saglikli sayilmali (bkz. yukaridaki depends_on notu).
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # --- Faz 13: Kafka consumer lag exporter ---
+  # Lag Kafka'nin kendi metrigi; uygulama kodundan expose edilemez. Onceden
+  # yalnizca benchmark.sh icinde CLI ile okunuyordu, yani uzerine alarm
+  # kurulamiyordu.
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    container_name: pulsecity-kafka-exporter
+    command:
+      - "--kafka.server=kafka:9092"
+    depends_on:
+      kafka:
+        condition: service_healthy
 
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -152,11 +238,25 @@ services:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
     depends_on:
       - producer
       - consumer
+
+  # --- Faz 13: Alertmanager ---
+  # Prometheus alarmi yalnizca HESAPLAR; gruplama, susturma ve bildirim
+  # kararlari bu serviste.
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: pulsecity-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -172,3 +272,7 @@ services:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
+
+volumes:
+  kafka-data:
+  scylla-data:

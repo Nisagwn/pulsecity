@@ -13,11 +13,16 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"errors"
+	"log/slog"
+	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -63,6 +68,18 @@ var (
 		Name: "pulsecity_zone_speed_baseline_kmh",
 		Help: "Bolge icin ogrenilen normal hiz baseline'i (EMA, km/h)",
 	}, []string{"zone_id"})
+	// Cifte hata (ScyllaDB VE DLQ ayni anda yazilamiyor): batch commit
+	// edilmeden birakilir, Kafka mesajlari yeniden teslim eder. Bu sayac
+	// alarma baglanacak sinyaldir - artiyorsa boru hatti ilerlemiyor demektir.
+	metricUncommittedBatches = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "pulsecity_consumer_uncommitted_batches_total",
+		Help: "Kalici olarak yazilamadigi icin offset'i commit EDILMEYEN batch sayisi",
+	})
+	// Readiness sondasi icin: ScyllaDB session'i canli mi.
+	metricScyllaUp = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "pulsecity_consumer_scylla_up",
+		Help: "ScyllaDB session'i saglikli mi: 1 = evet, 0 = hayir",
+	})
 )
 
 // --- Faz 8: Anomali tespiti --------------------------------------------------
@@ -84,6 +101,8 @@ const (
 	anomalyDropRatio = 0.40
 	// EMA agirligi: dusuk deger = baseline yavas ve istikrarli degisir.
 	baselineAlpha = 0.05
+	// DLQ yazimi kalici hata sayilmadan once kac kez denenir.
+	dlqWriteAttempts = 3
 )
 
 type zoneBaseline struct {
@@ -158,22 +177,72 @@ func updateZoneAnalytics(zoneID string, pings []VehiclePing) {
 	// onlarca satir akar.
 	if changed {
 		if anomaly {
-			log.Printf("[consumer] ANOMALI: %s bolgesinde hiz %.1f km/h, ogrenilen normal %.1f km/h (%%%.0f dusus)",
-				zoneID, current, baseline, (1-current/baseline)*100)
+			// Warn seviyesi: bu operatorun gormesi gereken bir durum, rutin
+			// ilerleme bilgisi degil.
+			slog.Warn("anomali tespit edildi",
+				"zone_id", zoneID,
+				"speed_kmh", round1(current),
+				"baseline_kmh", round1(baseline),
+				"drop_pct", round1((1-current/baseline)*100),
+			)
 		} else {
-			log.Printf("[consumer] %s bolgesi normale dondu: %.1f km/h (baseline %.1f km/h)",
-				zoneID, current, baseline)
+			slog.Info("bolge normale dondu",
+				"zone_id", zoneID,
+				"speed_kmh", round1(current),
+				"baseline_kmh", round1(baseline),
+			)
 		}
 	}
 }
 
-func startMetricsServer(addr string) {
+// round1, log alanlarini bir ondalik basamaga yuvarlar - ham float64
+// (8.033333333333333) log ciktisini okunmaz hale getiriyor.
+func round1(v float64) float64 {
+	return math.Round(v*10) / 10
+}
+
+// startMetricsServer, /metrics'in yani sira liveness ve readiness sondalarini
+// da sunar.
+//
+//   - /healthz (liveness): process ayakta ve HTTP'ye cevap veriyor mu.
+//   - /readyz  (readiness): ScyllaDB session'i GERCEKTEN kullanilabilir mi.
+//
+// Ikisinin ayri olmasi onemli: connectWithRetry yalnizca ACILISTA calisiyor.
+// Baglanti calisma sirasinda koparsa consumer process'i cokmez, her batch'i
+// DLQ'ya yazmaya devam eder ve disaridan bakan hicbir sey bunu fark etmezdi.
+// /readyz session uzerinde hafif bir sorgu kosturdugu icin tam bu durumu
+// yakalar ve Docker'in healthcheck'i container'i yeniden baslatir.
+func startMetricsServer(addr string, session *gocql.Session) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	log.Printf("[consumer] metrics endpoint: %s/metrics", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Printf("[consumer] metrics server hatasi: %v", err)
-	}
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		// system.local her node'da bulunan hafif bir tablodur; keyspace'e ya da
+		// uygulama verisine dokunmadan session'in canliligini olcer.
+		if err := session.Query("SELECT key FROM system.local").WithContext(ctx).Exec(); err != nil {
+			metricScyllaUp.Set(0)
+			http.Error(w, "scylla erisilemiyor: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		metricScyllaUp.Set(1)
+		w.Write([]byte("ok"))
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		slog.Info("metrics/health endpoint dinleniyor", "addr", addr,
+			"paths", "/metrics,/healthz,/readyz")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("metrics server hatasi", "err", err)
+		}
+	}()
+	return srv
 }
 
 type VehiclePing struct {
@@ -193,6 +262,50 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+// setupLogger, servisin genel logger'ini kurar.
+//
+// Neden yapilandirilmis log: onceki surumde her satir `log.Printf` ile
+// elle bicimlendirilmis duz metindi ("[consumer] ANOMALI: istanbul-sisli-1
+// bolgesinde hiz 8.0 km/h..."). Bir log toplama aracina (Loki/CloudWatch)
+// baglandiginda bolgeye gore filtrelemek ya da hiz esigine gore alarm kurmak
+// icin bu metni regex'le parse etmek gerekirdi - kirilgan ve pahali. JSON
+// alanlari ise dogrudan sorgulanabilir: {zone_id="istanbul-sisli-1"}.
+//
+// Seviye ayrimi da yeni: onceki surumde ANOMALI ile "batch islendi" ayni
+// seviyedeydi, yani "sadece hatalari goster" diye bir filtre kurulamiyordu.
+//
+// slog.SetDefault ayrica standart `log` paketinin ciktisini da bu handler'a
+// yonlendirir - gocql ve kafka-go kendi loglarini `log` ile yaziyor, onlar da
+// otomatik olarak yapilandirilmis hale gelir.
+func setupLogger(service string) *slog.Logger {
+	var level slog.Level
+	switch strings.ToLower(getenv("LOG_LEVEL", "info")) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+
+	var h slog.Handler
+	// Varsayilan JSON: konteyner ciktisi dogrudan makine tarafindan okunur.
+	// LOG_FORMAT=text yerelde goz ile okumak icin.
+	if strings.ToLower(getenv("LOG_FORMAT", "json")) == "text" {
+		h = slog.NewTextHandler(os.Stdout, opts)
+	} else {
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	}
+
+	l := slog.New(h).With("service", service)
+	slog.SetDefault(l)
+	return l
+}
+
 func main() {
 	brokers := getenv("KAFKA_BROKERS", "localhost:9092")
 	topic := getenv("KAFKA_TOPIC", "vehicle-pings")
@@ -200,8 +313,14 @@ func main() {
 	groupID := getenv("KAFKA_GROUP_ID", "pulsecity-consumers")
 	scyllaHosts := getenv("SCYLLA_HOSTS", "localhost:9042")
 
-	log.Printf("[consumer] baslatiliyor: brokers=%s topic=%s group=%s scylla=%s",
-		brokers, topic, groupID, scyllaHosts)
+	setupLogger("consumer")
+
+	slog.Info("baslatiliyor",
+		"brokers", brokers,
+		"topic", topic,
+		"group_id", groupID,
+		"scylla_hosts", scyllaHosts,
+	)
 
 	// --- ScyllaDB baglantisi ---
 	cluster := gocql.NewCluster(scyllaHosts)
@@ -213,7 +332,8 @@ func main() {
 
 	session, err := connectWithRetry(cluster, 10, 3*time.Second)
 	if err != nil {
-		log.Fatalf("[consumer] ScyllaDB'ye baglanilamadi: %v", err)
+		slog.Error("ScyllaDB'ye baglanilamadi, cikiliyor", "err", err)
+		os.Exit(1)
 	}
 	defer session.Close()
 
@@ -235,57 +355,94 @@ func main() {
 	}
 	defer dlqWriter.Close()
 
-	go startMetricsServer(getenv("METRICS_ADDR", ":2113"))
+	metricsSrv := startMetricsServer(getenv("METRICS_ADDR", ":2113"), session)
 
-	ctx := context.Background()
+	// SIGTERM'i yakala: `docker compose up -d` ile yapilan her deploy ve her
+	// restart bu sinyali gonderir, 10 saniye sonra SIGKILL gelir. Sinyali
+	// dinlemeden batch'in ortasinda oldurulmek veri kaybettirmez (commit
+	// edilmemis mesajlar yeniden teslim edilir) ama her deploy'u gereksiz bir
+	// reprocessing turuna cevirir.
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	batchSize, _ := strconv.Atoi(getenv("CONSUMER_BATCH_SIZE", "2000")) // Faz 3: buyutuldu
 	const flushInterval = 250 * time.Millisecond
 
 	msgBuf := make([]kafka.Message, 0, batchSize)
-	flushTicker := time.NewTicker(flushInterval)
-	defer flushTicker.Stop()
 
 	processedTotal := 0
 
-	flush := func() {
+	// flush, elindeki batch'i isler ve YALNIZCA kalici olarak yazildiysa
+	// offset'i commit eder.
+	flush := func(ctx context.Context) {
 		if len(msgBuf) == 0 {
 			return
 		}
-		writeBatchToScylla(session, dlqWriter, ctx, msgBuf)
+
+		if err := writeBatchToScylla(session, dlqWriter, ctx, msgBuf); err != nil {
+			// Ne ScyllaDB'ye ne DLQ'ya yazilabildi. Commit ETMIYORUZ: buffer'i
+			// bosaltip offset'i ilerletirsek mesajlar kaybolur. Buffer'i
+			// birakip donuyoruz, bir sonraki flush ayni mesajlari tekrar
+			// dener; consumer bu arada yeniden baslatilirsa Kafka onlari
+			// commit edilmemis offset'ten yeniden teslim eder.
+			return
+		}
 
 		// Basariyla islendi (ScyllaDB'ye yazildi ya da DLQ'ya yonlendirildi) ->
 		// simdi offset'i commit et. Bu sira ONEMLI: once isle, sonra commit et.
 		if err := reader.CommitMessages(ctx, msgBuf...); err != nil {
-			log.Printf("[consumer] offset commit hatasi: %v", err)
+			// Commit basarisiz: mesajlar ScyllaDB'de duruyor, kayip yok. Ayni
+			// mesajlar yeniden teslim edilecek ve ayni birincil anahtara
+			// yazilacak (idempotent). Buffer'i temizliyoruz ki bellek buyumesin.
+			slog.Warn("offset commit hatasi (mesajlar yazildi, yeniden islenecekler)",
+				"batch_size", len(msgBuf), "err", err)
 		}
 
 		processedTotal += len(msgBuf)
-		log.Printf("[consumer] batch islendi: %d, toplam: %d", len(msgBuf), processedTotal)
+		// Debug: 2000'lik batch'lerle 50k/sn'de saniyede ~25 satir eder.
+		// Rutin ilerleme bilgisi Info'yu bogar; ilerlemenin asil olcusu
+		// zaten pulsecity_consumer_messages_processed_total metrigi.
+		slog.Debug("batch islendi", "batch_size", len(msgBuf), "total", processedTotal)
 		msgBuf = msgBuf[:0]
 	}
 
+loop:
 	for {
 		// FetchMessage kullaniyoruz (ReadMessage degil) cunku otomatik commit yapmiyor.
-		fetchCtx, cancel := context.WithTimeout(ctx, flushInterval)
+		fetchCtx, cancel := context.WithTimeout(rootCtx, flushInterval)
 		m, err := reader.FetchMessage(fetchCtx)
 		cancel()
 
 		if err != nil {
-			if err == context.DeadlineExceeded {
-				flush() // zaman doldu, elimizdekini isle
+			if rootCtx.Err() != nil {
+				break loop // kapanis sinyali geldi
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				flush(rootCtx) // zaman doldu, elimizdekini isle
 				continue
 			}
-			log.Printf("[consumer] fetch hatasi: %v", err)
+			slog.Warn("kafka fetch hatasi", "err", err)
 			continue
 		}
 
 		msgBuf = append(msgBuf, m)
 
 		if len(msgBuf) >= batchSize {
-			flush()
+			flush(rootCtx)
 		}
 	}
+
+	// --- Duzenli kapanis ---
+	// rootCtx artik iptal edilmis durumda, son flush'i temiz bir context ile
+	// yapmamiz gerekiyor - aksi halde ScyllaDB yazimi ve commit aninda iptal
+	// olur ve elimizdeki batch bosuna yeniden islenirdi.
+	slog.Info("kapanis sinyali alindi, son batch isleniyor", "pending_messages", len(msgBuf))
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancelShutdown()
+
+	flush(shutdownCtx)
+	metricsSrv.Shutdown(shutdownCtx)
+	slog.Info("kapandi", "total_processed", processedTotal)
 }
 
 func connectWithRetry(cluster *gocql.ClusterConfig, attempts int, delay time.Duration) (*gocql.Session, error) {
@@ -296,7 +453,8 @@ func connectWithRetry(cluster *gocql.ClusterConfig, attempts int, delay time.Dur
 			return session, nil
 		}
 		lastErr = err
-		log.Printf("[consumer] ScyllaDB baglanti denemesi basarisiz (%d/%d): %v", i+1, attempts, err)
+		slog.Warn("ScyllaDB baglanti denemesi basarisiz",
+			"attempt", i+1, "max_attempts", attempts, "err", err)
 		time.Sleep(delay)
 	}
 	return nil, lastErr
@@ -311,7 +469,14 @@ func connectWithRetry(cluster *gocql.ClusterConfig, attempts int, delay time.Dur
 // Bunun yerine: mesajlari zone_id'ye gore grupluyoruz (ayni partition icindeki
 // batch'ler ucuzdur -> UnloggedBatch kullanilabilir) ve her zone grubunu
 // PARALEL goroutine'lerde yaziyoruz.
-func writeBatchToScylla(session *gocql.Session, dlqWriter *kafka.Writer, ctx context.Context, messages []kafka.Message) {
+//
+// DONUS DEGERI ZERO-LOSS ICIN KRITIK: nil olmayan bir hata "bu batch'in en az
+// bir mesaji hicbir yere kalici olarak yazilamadi" demektir ve cagiran taraf
+// offset'i commit ETMEMELIDIR. Onceki surumde bu fonksiyon void'di; ScyllaDB
+// ile DLQ ayni anda erisilemez oldugunda (ornegin genis bir network kesintisi)
+// yalnizca bir log satiri basiliyor, offset yine de ilerliyordu - mesajlar
+// sessizce kayboluyordu.
+func writeBatchToScylla(session *gocql.Session, dlqWriter *kafka.Writer, ctx context.Context, messages []kafka.Message) error {
 	start := time.Now()
 	defer func() { metricBatchWriteDuration.Observe(time.Since(start).Seconds()) }()
 
@@ -344,8 +509,8 @@ func writeBatchToScylla(session *gocql.Session, dlqWriter *kafka.Writer, ctx con
 			}
 
 			if err := session.ExecuteBatch(batch); err != nil {
-				log.Printf("[consumer] SCYLLA YAZMA HATASI (zone=%s), %d mesaj DLQ'ya yonlendiriliyor: %v",
-					zoneID, len(pings), err)
+				slog.Error("scylla batch yazma hatasi, mesajlar DLQ'ya yonlendiriliyor",
+					"zone_id", zoneID, "message_count", len(pings), "err", err)
 				dlqMu.Lock()
 				for _, p := range pings {
 					raw, _ := json.Marshal(p)
@@ -362,15 +527,44 @@ func writeBatchToScylla(session *gocql.Session, dlqWriter *kafka.Writer, ctx con
 	wg.Wait()
 
 	if len(dlqMessages) > 0 {
-		if err := dlqWriter.WriteMessages(ctx, dlqMessages...); err != nil {
-			// Son care senaryo: DLQ'ya bile yazamiyorsak logla (Faz 5 dayaniklilik
-			// testleri bu senaryoyu da olcer).
-			log.Printf("[consumer] KRITIK: DLQ'ya yazma da basarisiz oldu, veri kaybi riski: %v", err)
+		if err := writeDLQWithRetry(ctx, dlqWriter, dlqMessages, dlqWriteAttempts); err != nil {
+			// Son care senaryo: ScyllaDB'ye de DLQ'ya da yazamiyoruz. Tek
+			// yapabilecegimiz dogru sey commit ETMEMEK; Kafka mesajlari
+			// yeniden teslim eder. ScyllaDB'ye zaten yazilmis olan mesajlar
+			// tekrar islenir ama birincil anahtar ayni oldugu icin uzerine
+			// yazilir - coklanma olmaz, at-least-once burada guvenli.
+			slog.Error("KRITIK: scylla VE DLQ yazilamadi, batch commit edilmiyor",
+				"message_count", len(messages),
+				"action", "kafka mesajlari yeniden teslim edecek",
+				"err", err)
+			metricUncommittedBatches.Inc()
+			return err
 		}
 		metricDLQTotal.Add(float64(len(dlqMessages)))
 	}
 
 	metricProcessedTotal.Add(float64(len(messages) - len(dlqMessages)))
+	return nil
+}
+
+// writeDLQWithRetry, DLQ yazimini kisa bir backoff'la yeniden dener.
+// Producer tarafinda writeWithRetry ile korunan yol burada korumasizdi:
+// anlik bir broker hiccup'i dogrudan "kalici hata" sayiliyordu.
+func writeDLQWithRetry(ctx context.Context, w *kafka.Writer, msgs []kafka.Message, attempts int) error {
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err = w.WriteMessages(ctx, msgs...); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err // kapanis suruyor, denemeye devam etmenin anlami yok
+		}
+		backoff := time.Duration(attempt) * 200 * time.Millisecond
+		slog.Warn("DLQ yazma denemesi basarisiz",
+			"attempt", attempt, "max_attempts", attempts, "backoff", backoff.String(), "err", err)
+		time.Sleep(backoff)
+	}
+	return err
 }
 
 func toDLQMessage(payload []byte, reason string) kafka.Message {

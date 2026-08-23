@@ -8,14 +8,18 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"errors"
+	"log/slog"
 	"math"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -37,13 +41,50 @@ var (
 	})
 )
 
-func startMetricsServer(addr string) {
+// lastWriteOK, Kafka'ya en son basariyla yazilan saniyenin unix zamani.
+// /readyz bu degere bakar: process ayakta olabilir ama broker'a hic
+// yazamiyorsa saglikli sayilmamali.
+var lastWriteOK atomic.Int64
+
+// Producer saniyede bir yazar; bu suredir basarili yazma yoksa hazir degiliz.
+// Esik writeWithRetry'in toplam backoff'undan (5 deneme, ~3sn) belirgin
+// sekilde buyuk secildi ki gecici bir broker hiccup'i restart tetiklemesin.
+const readyStaleAfter = 30 * time.Second
+
+// startMetricsServer, /metrics'in yani sira liveness ve readiness sondalarini
+// sunar ve sunucuyu duzenli kapatabilmek icin geri dondurur.
+func startMetricsServer(addr string) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	log.Printf("[producer] metrics endpoint: %s/metrics", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Printf("[producer] metrics server hatasi: %v", err)
-	}
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		last := lastWriteOK.Load()
+		if last == 0 {
+			// Henuz ilk tur tamamlanmadi; start_period bu araligi kapsiyor.
+			http.Error(w, "ilk yazma henuz tamamlanmadi", http.StatusServiceUnavailable)
+			return
+		}
+		if age := time.Since(time.Unix(last, 0)); age > readyStaleAfter {
+			http.Error(w, "Kafka'ya son basarili yazmanin uzerinden "+age.Truncate(time.Second).String()+" gecti",
+				http.StatusServiceUnavailable)
+			return
+		}
+		w.Write([]byte("ok"))
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		slog.Info("metrics/health endpoint dinleniyor", "addr", addr,
+			"paths", "/metrics,/healthz,/readyz")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("metrics server hatasi", "err", err)
+		}
+	}()
+	return srv
 }
 
 // VehiclePing, Kafka'ya gonderilen tek bir GPS event'ini temsil eder.
@@ -200,6 +241,39 @@ func (v *vehicleState) step(rng *rand.Rand, dt, speedFactor float64) float64 {
 	return effectiveSpeed
 }
 
+// setupLogger, servisin genel logger'ini kurar. Gerekce ve alan semasi icin
+// bkz. consumer/main.go — uc servis de ayni sozlesmeye uyar: JSON varsayilan,
+// LOG_FORMAT=text yerel okuma icin, LOG_LEVEL ile seviye.
+//
+// slog.SetDefault standart `log` paketinin ciktisini da bu handler'a yonlendirir;
+// kafka-go kendi loglarini `log` ile yaziyor, onlar da yapilandirilmis olur.
+func setupLogger(service string) *slog.Logger {
+	var level slog.Level
+	switch strings.ToLower(getenv("LOG_LEVEL", "info")) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+
+	var h slog.Handler
+	if strings.ToLower(getenv("LOG_FORMAT", "json")) == "text" {
+		h = slog.NewTextHandler(os.Stdout, opts)
+	} else {
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	}
+
+	l := slog.New(h).With("service", service)
+	slog.SetDefault(l)
+	return l
+}
+
 func getenv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
@@ -235,16 +309,35 @@ func speedFactorFor(zoneIdx int) float64 {
 	return 1.0
 }
 
-func runAnomalyDemo(rng *rand.Rand) {
+// runAnomalyDemo, ctx iptal edilene kadar periyodik olarak bir bolgeyi yapay
+// olarak tikar. ctx olmadan bu goroutine kapanis sirasinda uyumaya devam eder
+// ve process'in temiz cikisini geciktirirdi.
+func runAnomalyDemo(ctx context.Context, rng *rand.Rand) {
+	sleep := func(d time.Duration) bool {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+			return true
+		}
+	}
+
 	for {
-		time.Sleep(demoPeriod - demoDuration)
+		if !sleep(demoPeriod - demoDuration) {
+			return
+		}
 		idx := rng.Intn(len(zones))
 		congestedZone.Store(int32(idx))
-		log.Printf("[producer] DEMO: %s bolgesi %v boyunca yapay olarak tikandi",
-			zones[idx].ID, demoDuration)
-		time.Sleep(demoDuration)
+		slog.Info("demo: bolge yapay olarak tikandi",
+			"zone_id", zones[idx].ID, "duration", demoDuration.String())
+		if !sleep(demoDuration) {
+			congestedZone.Store(-1)
+			return
+		}
 		congestedZone.Store(-1)
-		log.Printf("[producer] DEMO: %s bolgesi normale dondu", zones[idx].ID)
+		slog.Info("demo: bolge normale dondu", "zone_id", zones[idx].ID)
 	}
 }
 
@@ -255,9 +348,15 @@ func writeWithRetry(ctx context.Context, writer *kafka.Writer, batch []kafka.Mes
 		if err == nil {
 			return nil
 		}
+		if ctx.Err() != nil {
+			// Kapanis suruyor: backoff'la beklemenin anlami yok, SIGKILL'e
+			// kadar olan sureyi tuketmis oluruz.
+			return err
+		}
 		backoff := time.Duration(attempt) * 200 * time.Millisecond
-		log.Printf("[producer] yazma denemesi %d/%d basarisiz, %v sonra tekrar denenecek: %v",
-			attempt, maxAttempts, backoff, err)
+		slog.Warn("kafka yazma denemesi basarisiz",
+			"attempt", attempt, "max_attempts", maxAttempts,
+			"backoff", backoff.String(), "err", err)
 		time.Sleep(backoff)
 	}
 	return err
@@ -278,8 +377,16 @@ func main() {
 	// hareket ediyormus gibi gorunmesine yol acar.
 	dt := float64(vehicleCount) / float64(targetRate)
 
-	log.Printf("[producer] baslatiliyor: brokers=%s topic=%s hedef_hiz=%d/sn arac_sayisi=%d ping_araligi=%.3fsn anomali_demo=%v",
-		brokers, topic, targetRate, vehicleCount, dt, anomalyDemo)
+	setupLogger("producer")
+
+	slog.Info("baslatiliyor",
+		"brokers", brokers,
+		"topic", topic,
+		"target_rate_per_sec", targetRate,
+		"vehicle_count", vehicleCount,
+		"ping_interval_sec", math.Round(dt*1000)/1000,
+		"anomaly_demo", anomalyDemo,
+	)
 
 	writer := &kafka.Writer{
 		Addr:         kafka.TCP(brokers),
@@ -297,7 +404,12 @@ func main() {
 	}
 	defer writer.Close()
 
-	go startMetricsServer(getenv("METRICS_ADDR", ":2112"))
+	metricsSrv := startMetricsServer(getenv("METRICS_ADDR", ":2112"))
+
+	// SIGTERM: Docker her restart/deploy'da bu sinyali gonderir. Yakalamadan
+	// oldurulmek, ucusta olan bir Kafka yaziminin yarida kesilmesi demek.
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -307,13 +419,13 @@ func main() {
 	}
 
 	if anomalyDemo {
-		go runAnomalyDemo(rand.New(rand.NewSource(time.Now().UnixNano() + 9999)))
+		go runAnomalyDemo(rootCtx, rand.New(rand.NewSource(time.Now().UnixNano()+9999)))
 	}
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	ctx := context.Background()
+	ctx := rootCtx
 	sentTotal := 0
 
 	// Her worker'in kendi rand.Rand instance'i olmali - math/rand.Rand
@@ -332,7 +444,18 @@ func main() {
 		vehiclesPerWorker = 1
 	}
 
-	for range ticker.C {
+	for {
+		select {
+		case <-rootCtx.Done():
+			// Ucustaki tur yok (wg.Wait asagida bitiyor); guvenle cikabiliriz.
+			slog.Info("kapanis sinyali alindi", "total_sent", sentTotal)
+			shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+			metricsSrv.Shutdown(shutdownCtx)
+			cancelShutdown()
+			return
+		case <-ticker.C:
+		}
+
 		secondStart := time.Now()
 
 		// Faz 3: 50k/sn'lik batch'i workerCount kadar paralel goroutine'e
@@ -383,8 +506,8 @@ func main() {
 					writeErr = err
 					mu.Unlock()
 					metricProduceErrors.Add(float64(len(batch)))
-					log.Printf("[producer] worker-%d KRITIK: yazma basarisiz, %d mesaj kaybolmus olabilir: %v",
-						workerID, len(batch), err)
+					slog.Error("KRITIK: worker yazma basarisiz, mesajlar kaybolmus olabilir",
+						"worker_id", workerID, "message_count", len(batch), "err", err)
 					return
 				}
 
@@ -396,10 +519,20 @@ func main() {
 
 		wg.Wait()
 
+		if totalWritten > 0 {
+			// /readyz bu damgaya bakar: yazma tamamen durursa readiness duser
+			// ve Docker healthcheck'i container'i yeniden baslatir.
+			lastWriteOK.Store(time.Now().Unix())
+		}
+
 		sentTotal += totalWritten
 		metricProducedTotal.Add(float64(totalWritten))
 		elapsed := time.Since(secondStart)
-		log.Printf("[producer] bu saniyede gonderilen: %d (hedef: %d), sure: %v, toplam: %d, hata: %v",
-			totalWritten, targetRate, elapsed, sentTotal, writeErr != nil)
+		// Debug: saniyede bir satir, Info'da uzun kosularda gurultu yapar.
+		// Throughput'un asil olcusu pulsecity_producer_messages_total metrigi.
+		slog.Debug("saniyelik tur tamamlandi",
+			"sent", totalWritten, "target", targetRate,
+			"duration_ms", elapsed.Milliseconds(), "total", sentTotal,
+			"had_error", writeErr != nil)
 	}
 }

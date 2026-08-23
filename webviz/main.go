@@ -20,12 +20,17 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
-	"log"
+	"errors"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -56,6 +61,19 @@ var (
 		Help: "Yayina yetisemedigi icin dusurulen istemci sayisi",
 	})
 )
+
+// kafkaReadErrors, ust uste kac Kafka okuma hatasi alindigini sayar; basarili
+// her okumada sifirlanir. /readyz bu sayaca bakar.
+//
+// Neden "son mesajin uzerinden gecen sure" degil: producer duruyorsa mesaj
+// gelmemesi normaldir ve webviz yine de saglikli. Ayirt etmemiz gereken sey
+// "veri yok" ile "broker'a ulasamiyorum" - onu da ancak hata sayarak
+// gorebiliriz.
+var kafkaReadErrors atomic.Int64
+
+// Bu kadar ust uste hatadan sonra hazir degiliz. Okuma dongusu hata basina
+// ~1sn bekledigi icin bu kabaca 10 saniyelik kesintisiz basarisizliga denk.
+const maxConsecutiveReadErrors = 10
 
 // VehiclePing, producer'in Kafka'ya yazdigi event ile ayni sema.
 type VehiclePing struct {
@@ -336,6 +354,26 @@ func (h *hub) clientCount() int {
 	return len(h.clients)
 }
 
+// closeAll, kapanista tum WebSocket baglantilarini duzenli sekilde kapatir.
+//
+// http.Server.Shutdown hijack edilmis baglantilari (WebSocket bunlardan biri)
+// ne bekler ne de kapatir. Elle kapatmazsak tarayici tarafi sunucunun
+// kapandigini anlamaz, TCP timeout'una kadar olu bir baglantiyi acik tutar.
+// CloseGoingAway gonderdigimizde ise istemcideki yeniden baglanma mantigi
+// hemen devreye girer.
+func (h *hub) closeAll() {
+	h.clientsMu.Lock()
+	defer h.clientsMu.Unlock()
+	for c := range h.clients {
+		c.conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "sunucu kapaniyor"),
+			time.Now().Add(time.Second),
+		)
+		c.conn.Close()
+	}
+}
+
 func (h *hub) broadcast(payload []byte) {
 	h.clientsMu.RLock()
 	targets := make([]*client, 0, len(h.clients))
@@ -359,7 +397,7 @@ func (h *hub) broadcast(payload []byte) {
 func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[webviz] websocket upgrade hatasi: %v", err)
+		slog.Warn("websocket upgrade hatasi", "remote_addr", r.RemoteAddr, "err", err)
 		return
 	}
 	c := &client{conn: conn, send: make(chan []byte, 8)}
@@ -444,12 +482,21 @@ func fetchZoneSignals(ctx context.Context, promURL string) map[string]zoneSignal
 		if err != nil {
 			continue
 		}
+		// Consumer birden fazla replika ile calisir (prod'da 3). Normalde bir
+		// zone_id tek bir replikaya duser, ama bir rebalance sonrasi ESKI
+		// replika o bolgenin gauge'unu bir sure daha tutmaya devam eder -
+		// yani ayni zone_id icin gecici olarak iki seri donebilir. Uzerine
+		// yazmak hangi serinin sonra geldigine bagli, yani rastgele bir sonuc
+		// verirdi; bunun yerine deterministik olarak birlestiriyoruz.
 		s := out[zone]
 		switch r.Metric["__name__"] {
 		case "pulsecity_zone_anomaly_detected":
-			s.anomaly = val >= 1
+			// Replikalardan biri "anomali var" diyorsa anomali vardir.
+			s.anomaly = s.anomaly || val >= 1
 		case "pulsecity_zone_speed_baseline_kmh":
-			s.baseline = val
+			if val > s.baseline {
+				s.baseline = val
+			}
 		}
 		out[zone] = s
 	}
@@ -457,6 +504,35 @@ func fetchZoneSignals(ctx context.Context, promURL string) map[string]zoneSignal
 }
 
 // --- main -------------------------------------------------------------------
+
+// setupLogger, servisin genel logger'ini kurar. Gerekce ve alan semasi icin
+// bkz. consumer/main.go — uc servis de ayni sozlesmeye uyar.
+func setupLogger(service string) *slog.Logger {
+	var level slog.Level
+	switch strings.ToLower(getenv("LOG_LEVEL", "info")) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+
+	var h slog.Handler
+	if strings.ToLower(getenv("LOG_FORMAT", "json")) == "text" {
+		h = slog.NewTextHandler(os.Stdout, opts)
+	} else {
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	}
+
+	l := slog.New(h).With("service", service)
+	slog.SetDefault(l)
+	return l
+}
 
 func getenv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
@@ -482,8 +558,15 @@ func main() {
 	// okunurdu; ortalama hiz ve merkez bu ornek uzerinden de saglikli cikar.
 	histRowsPerZone, _ := strconv.Atoi(getenv("HISTORY_ROWS_PER_ZONE", "2000"))
 
-	log.Printf("[webviz] baslatiliyor: brokers=%s topic=%s group=%s yayin=%dms max_arac=%d",
-		brokers, topic, groupID, intervalMs, maxVehicles)
+	setupLogger("webviz")
+
+	slog.Info("baslatiliyor",
+		"brokers", brokers,
+		"topic", topic,
+		"group_id", groupID,
+		"broadcast_interval_ms", intervalMs,
+		"max_vehicles", maxVehicles,
+	)
 
 	h := newHub(maxVehicles)
 	history := newHistoryStore(
@@ -507,7 +590,9 @@ func main() {
 	})
 	defer reader.Close()
 
-	ctx := context.Background()
+	// SIGTERM/SIGINT: her deploy ve restart bu sinyali gonderir.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// Scylla baglantisi arka planda kurulur; hazir olana kadar harita canli
 	// modda calisir, yalnizca zaman kaydiricisi kapali kalir.
@@ -517,10 +602,16 @@ func main() {
 		for {
 			m, err := reader.ReadMessage(ctx)
 			if err != nil {
-				log.Printf("[webviz] kafka okuma hatasi: %v", err)
+				if ctx.Err() != nil {
+					return // kapanis
+				}
+				kafkaReadErrors.Add(1)
+				slog.Warn("kafka okuma hatasi",
+					"consecutive_errors", kafkaReadErrors.Load(), "err", err)
 				time.Sleep(time.Second)
 				continue
 			}
+			kafkaReadErrors.Store(0)
 			var p VehiclePing
 			if err := json.Unmarshal(m.Value, &p); err != nil {
 				continue
@@ -538,7 +629,13 @@ func main() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		last := time.Now()
-		for range ticker.C {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+
 			now := time.Now()
 			window := now.Sub(last).Seconds()
 			last = now
@@ -571,8 +668,43 @@ func main() {
 	mux.HandleFunc("/ws", h.serveWS)
 	mux.Handle("/metrics", promhttp.Handler())
 
-	log.Printf("[webviz] harita hazir: http://localhost%s", listenAddr)
-	if err := http.ListenAndServe(listenAddr, mux); err != nil {
-		log.Fatalf("[webviz] http server hatasi: %v", err)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	// DIKKAT: /readyz ScyllaDB'ye BAKMAZ. Gecmise bakma kritik yol degil -
+	// Scylla dusse bile canli harita calismaya devam etmeli, yalnizca zaman
+	// kaydiricisi gizlenir. Buraya bir Scylla kontrolu koymak, calisan bir
+	// haritayi sirf gecmis okunamiyor diye yeniden baslattirirdi.
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if n := kafkaReadErrors.Load(); n >= maxConsecutiveReadErrors {
+			http.Error(w, "Kafka okunamiyor ("+strconv.FormatInt(n, 10)+" ust uste hata)",
+				http.StatusServiceUnavailable)
+			return
+		}
+		w.Write([]byte("ok"))
+	})
+
+	srv := &http.Server{Addr: listenAddr, Handler: mux}
+
+	go func() {
+		slog.Info("harita hazir", "addr", listenAddr, "url", "http://localhost"+listenAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("http server hatasi, cikiliyor", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Info("kapanis sinyali alindi, istemci baglantilari kapatiliyor",
+		"connected_clients", h.clientCount())
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+
+	h.closeAll()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("http kapanis hatasi", "err", err)
 	}
+	slog.Info("kapandi")
 }
