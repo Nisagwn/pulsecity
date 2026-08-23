@@ -1,0 +1,105 @@
+# PulseCity — Promtail yapilandirmasi (Faz 17)
+#
+# Konteyner loglarini toplayip Loki'ye gonderir.
+#
+# Faz 13'te uc Go servisi log/slog ile JSON'a gecmis, Faz 16'da Caddy de JSON
+# erisim logu yazmaya baslamisti. Bu adim o hazirligin karsiligini aliyor:
+# duz metin loglarda "hangi bolgede anomali vardi" sorusu regex ile
+# kazilirdi; JSON'da alan olarak sorgulanabiliyor.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  # Nereye kadar okundugunu tutar; Promtail yeniden baslatildiginda ayni
+  # loglari bastan gondermez.
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    # Docker API uzerinden konteyner kesfi. Dosya tabanli
+    # (/var/lib/docker/containers/*.log) alternatifine gore avantaji:
+    # konteyner etiketlerine (compose servis adi gibi) erisebiliyoruz ve
+    # yeni konteynerler otomatik yakalaniyor.
+    #
+    # BEDELI: Docker soketine erisim gerekiyor. Soket SALT OKUNUR baglandi,
+    # ama soket uzerinden okuma yetkisi bile onemsiz degildir - konteyner
+    # listesi ve yapilandirmasi gorunur olur. Bu kurulumda kabul edilebilir
+    # (tek makine, tek operator); paylasilan bir ortamda docker-socket-proxy
+    # gibi bir katman arasina konmalidir.
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+
+    relabel_configs:
+      # /pulsecity-consumer-1 -> pulsecity-consumer-1
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: container
+
+      # compose servis adi: replikalardan bagimsiz olarak "consumer".
+      # 3 replika calisirken uc ayri container etiketi olur ama compose_service
+      # tektir - "tum consumer loglari" sorgusu bununla yapilir.
+      - source_labels: ["__meta_docker_container_label_com_docker_compose_service"]
+        target_label: compose_service
+
+      # Bu compose projesine ait olmayan konteynerleri toplama.
+      - source_labels: ["__meta_docker_container_label_com_docker_compose_project"]
+        regex: "pulsecity"
+        action: keep
+
+    pipeline_stages:
+      # JSON ayristirma YALNIZCA JSON yazan servislere uygulanir.
+      # Kafka, ScyllaDB, Prometheus gibi bilesenler duz metin yazar; onlara
+      # json stage uygulamak her satirda ayristirma hatasi uretirdi.
+      - match:
+          selector: '{compose_service=~"producer|consumer|webviz"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  service: service
+                  timestamp: time
+            # slog'un yazdigi zaman damgasini kullan; Promtail'in dosyayi
+            # okudugu an degil, olayin GERCEKTEN olustugu an.
+            - timestamp:
+                source: timestamp
+                format: RFC3339Nano
+            - labels:
+                level:
+                service:
+
+      # Caddy erisim loglari da JSON ama semasi farkli (level yerine
+      # kendi alanlari var).
+      - match:
+          selector: '{compose_service="caddy"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  timestamp: ts
+            - labels:
+                level:
+
+# --- ETIKET SECIMI: neden zone_id ETIKET DEGIL ---
+#
+# Loki log ICERIGINI indekslemez, yalnizca ETIKETLERI indeksler. Her benzersiz
+# etiket kombinasyonu ayri bir "stream" acar ve her stream'in kendi chunk'lari
+# olur. Etiket sayisi arttikca chunk'lar kuculur, dosya sayisi patlar ve sorgu
+# performansi duser - Loki'de en sik yapilan hata budur.
+#
+# zone_id (9 deger) kardinalite acisindan sinirda kabul edilebilir olurdu, ama
+# etiket YAPILMADI cunku asil sorun kardinalite degil: zone_id yalnizca BAZI
+# satirlarda var (anomali loglari). Yalnizca bazi satirlarda bulunan bir alani
+# etiketlemek ayni servisin loglarini iki ayri stream'e boler ve zaman sirasi
+# icinde okumayi zorlastirir.
+#
+# Bunun yerine sorgu aninda ayristirilir - Loki bunu verimli yapar:
+#
+#   {compose_service="consumer"} | json | zone_id="istanbul-uskudar"
+#   {compose_service="consumer", level="WARN"} | json | drop_pct > 40

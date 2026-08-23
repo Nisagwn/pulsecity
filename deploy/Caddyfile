@@ -1,0 +1,110 @@
+# PulseCity — Caddy reverse proxy + otomatik TLS (Faz 16)
+#
+# Nginx'in yerini aldı. Gerekçe tek satırla: Caddy sertifikayı kendisi alır,
+# kendisi yeniler ve HTTP'yi HTTPS'e kendisi yönlendirir. Nginx ile aynı şey
+# için certbot + cron/systemd timer + yenileme sonrası reload kancası + nginx
+# TLS blokları gerekirdi — dört ayrı hareketli parça, her biri sessizce
+# bozulabilen.
+#
+# Alan adı ve e-posta ortam değişkeninden gelir (.env, cloud-init üretir):
+#   PULSECITY_DOMAIN=nisagvn.duckdns.org
+#   ACME_EMAIL=...
+#
+# {$VAR:varsayilan} sözdizimi Caddy'nin kendi ortam değişkeni ikamesi.
+{
+	# ACME hesabı için iletişim adresi. Let's Encrypt sertifika süresi
+	# dolmak üzereyken ve politika değişikliklerinde buraya yazar.
+	email {$ACME_EMAIL:admin@example.invalid}
+
+	# TEST EDERKEN STAGING KULLAN.
+	#
+	# Let's Encrypt üretim ortamında "aynı sertifika" için haftada 5 istek
+	# sınırı vardır; yanlış yapılandırmayla birkaç kez deneyince hafta boyu
+	# kilitlenirsin ve bunun geri dönüşü yoktur — beklemek zorundasın.
+	# Staging'in sınırı çok daha geniş, sertifikası tarayıcıda güvenilmez
+	# görünür ama zincirin çalıştığını kanıtlar.
+	#
+	#   ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory
+	acme_ca {$ACME_CA:https://acme-v02.api.letsencrypt.org/directory}
+}
+
+# Alan adı verilmezse `:80`e düşer — yani TLS'siz, eski Nginx davranışının
+# aynısı. Böylece domain'i olmayan bir kurulum da (ya da ilk deneme) çalışır;
+# TLS, alan adı tanımlandığı anda kendiliğinden devreye girer.
+#
+# Caddy alan adı gördüğünde otomatik olarak HTTPS'e geçer ve HTTP'yi
+# yönlendirir; ayrıca bir yapılandırma gerekmez.
+{$PULSECITY_DOMAIN::80} {
+	# --- Faz 9: canlı harita (kök adres) ---
+	#
+	# WebSocket için ayrı bir blok YOK: Caddy'nin reverse_proxy'si Upgrade/
+	# Connection başlıklarını ve HTTP/1.1 yükseltmesini kendiliğinden yönetir.
+	# Nginx'te bu, unutulduğunda haritanın sürekli yeniden bağlanmasına yol
+	# açan ayrı bir `location /ws` bloğu gerektiriyordu.
+	handle /grafana/* {
+		uri strip_prefix /grafana
+		reverse_proxy grafana:3000
+	}
+
+	handle {
+		# --- Blue-green (Faz 18) ---
+		#
+		# İki upstream birden tanımlı ama `lb_policy first` her zaman
+		# SIRADAKİ İLK SAĞLIKLI upstream'i seçer. Yani:
+		#
+		#   ikisi de ayakta  -> trafik webviz'de (blue)
+		#   blue durdurulur  -> trafik webviz-green'e geçer
+		#   blue geri gelir  -> trafik blue'ya döner (rollback)
+		#
+		# Geçiş böylece bir KONTEYNER İŞLEMİ oluyor; Caddy yapılandırması
+		# değişmiyor, reload gerekmiyor, üretilen bir dosya yok. Sağlık
+		# kontrolü `/readyz`e vurduğu için yeni sürüm hazır olmadan trafik
+		# almıyor — Faz 12'de eklenen readiness sondası burada ikinci kez
+		# işe yarıyor.
+		#
+		# webviz-green normalde ÇALIŞMAZ (compose profili arkasında); yalnızca
+		# deploy sırasında ayağa kalkar. Bu yüzden Caddy onu sürekli
+		# "unhealthy" görür ve loglar — beklenen durum.
+		reverse_proxy webviz:8080 webviz-green:8080 {
+			lb_policy first
+
+			health_uri /readyz
+			health_interval 3s
+			health_timeout 2s
+			health_status 200
+
+			# Bir upstream cevap vermezse diğerini dene: geçiş anında
+			# uçuşta olan istekler düşmesin.
+			lb_try_duration 5s
+			lb_try_interval 250ms
+		}
+	}
+
+	# --- Güvenlik başlıkları ---
+	header {
+		# HSTS: tarayıcı bu alan adına bir daha HTTP ile gitmesin.
+		# max-age 1 yıl. DİKKAT: bir kez gönderildikten sonra tarayıcı bunu
+		# hatırlar; HTTPS'ten geri dönmek istersen önce max-age'i 0 yapıp
+		# yayına almalısın.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+		# MIME type sniffing kapalı.
+		X-Content-Type-Options "nosniff"
+
+		# Clickjacking: harita bir iframe içine gömülmesin.
+		X-Frame-Options "SAMEORIGIN"
+
+		Referrer-Policy "strict-origin-when-cross-origin"
+
+		# Sunucu sürümünü sızdırma.
+		-Server
+	}
+
+	# Erişim logları JSON olarak stdout'a — Faz 13'te uygulama loglarını
+	# yapılandırdık, reverse proxy de aynı biçimde konuşsun ki tek bir log
+	# toplama hattı (Faz 17: Loki) hepsini aynı şekilde işleyebilsin.
+	log {
+		output stdout
+		format json
+	}
+}

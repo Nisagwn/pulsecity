@@ -86,6 +86,42 @@ variable "allowed_http_cidr" {
   default     = "0.0.0.0/0"
 }
 
+variable "domain" {
+  description = <<-EOT
+    Sistemin yayinlanacagi alan adi (or. nisagvn.duckdns.org).
+
+    Bos birakilirsa TLS devre disi kalir ve sistem yalnizca HTTP uzerinden,
+    IP adresiyle servis edilir. Let's Encrypt IP adresine sertifika VERMEZ -
+    HTTP-01 dogrulamasi cozulebilir bir alan adi gerektirir.
+
+    A kaydinin bu sunucunun Elastic IP'sine isaret etmesi gerekir. DuckDNS
+    kullaniyorsan secrets/duckdns_token.enc doldurulursa cloud-init bunu
+    acilista otomatik gunceller.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.domain == "" || can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", var.domain))
+    error_message = "Gecerli bir alan adi ver (or. nisagvn.duckdns.org) - protokol ya da yol olmadan."
+  }
+}
+
+variable "acme_email" {
+  description = <<-EOT
+    Let's Encrypt hesabi icin iletisim adresi. Sertifika suresi dolmak
+    uzereyken ve politika degisikliklerinde buraya bildirim gelir.
+    domain verildiyse zorunludur.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.acme_email == "" || can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", var.acme_email))
+    error_message = "Gecerli bir e-posta adresi ver."
+  }
+}
+
 variable "age_private_key" {
   description = <<-EOT
     SOPS age OZEL anahtari (AGE-SECRET-KEY-1... ile baslar). Sunucu depodaki

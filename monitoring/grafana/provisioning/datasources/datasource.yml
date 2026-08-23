@@ -7,3 +7,22 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: true
+
+  # Faz 17: log toplama. Metrikler "ne kadar" sorusunu, loglar "neden"
+  # sorusunu yanitlar; ikisi ayni Grafana'da olunca bir alarmdan ilgili log
+  # satirlarina tek tiklamayla gecilebiliyor.
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+    jsonData:
+      # Metrikten loga gecis: bir panelde anomali goruldugunde, o bolgenin
+      # o andaki consumer loglarina dogrudan atlamak icin.
+      derivedFields:
+        - name: "zone_id"
+          # JSON loglardaki zone_id alanini yakalar ve tiklanabilir hale
+          # getirir (Loki'nin kendi icinde arama yapar).
+          matcherRegex: '"zone_id":"([^"]+)"'
+          url: '/explore?left={"datasource":"Loki","queries":[{"expr":"{compose_service=\"consumer\"} |= \"$${__value.raw}\""}]}'
+          datasourceUid: loki

@@ -44,10 +44,10 @@ izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
 ├── webviz/                  # Go WebSocket servisi + Leaflet canlı harita (Faz 9)
 │                            # + ScyllaDB'den geçmişe bakma (Faz 11)
 ├── scylla-init/schema.cql   # ScyllaDB şema tanımı
-├── monitoring/              # Prometheus config + alarm kuralları, Alertmanager,
+├── monitoring/              # Prometheus + alarm kuralları, Alertmanager, Loki/Promtail,
 │                            # Grafana provisioning/dashboard
 ├── scripts/                 # zero-loss testi, benchmark, chaos testing scriptleri
-├── deploy/                  # Production/CI compose override, Nginx, VPS deployment rehberi
+├── deploy/                  # Production/CI compose override, Caddy (TLS), Nginx, VPS rehberi
 ├── infra/terraform/         # Altyapı kod olarak: VPC, EC2, IAM, SSM (Faz 14)
 └── .github/workflows/       # CI/CD (lint, test, uçtan uca test, imaj yayınlama)
 ```
@@ -62,8 +62,13 @@ Servisler ayağa kalktıktan (~30sn) sonra:
 
 - **Canlı harita**: http://localhost:8080 — bölgeler yoğunluğa göre renklenir,
   araçlar nokta olarak akar, anomali tespit edilen bölge kırmızı yanıp söner
-- **Grafana**: http://localhost:3000 (admin / pulsecity) — canlı dashboard
+- **Grafana**: http://localhost:3000 (admin / pulsecity) — canlı dashboard +
+  log paneli (Faz 17)
 - **Prometheus**: http://localhost:9090 — ham metrikler
+- **Alertmanager**: http://localhost:9093 — alarm durumu, gruplama ve
+  susturma (Faz 13)
+- **Loki**: http://localhost:3100 — log sorgusu; Grafana'dan da erişilebilir
+  (Faz 17)
 - ScyllaDB'de veri doğrulama: `docker exec -it pulsecity-scylla cqlsh -e "SELECT * FROM pulsecity.vehicle_pings LIMIT 10;"`
 
 Consumer'ı paralel ölçeklendirmek için:
@@ -552,6 +557,246 @@ iki yönde test edildi (temiz depoda susuyor, gerçek anahtar eklenince yakalıy
 `amtool check-config` prod yapılandırmasında başarılı · `terraform validate` başarılı ·
 GitHub Push Protection tetiklendi ve düzgün biçimde çözüldü.
 
+### Faz 16 — TLS (Caddy) ✅
+README'nin "bilinen sınırlamalar" listesinde Faz 6'dan beri duran madde:
+*"TLS/HTTPS henüz yok."* Bu faz onu kapatır — ve Nginx'i Caddy ile değiştirir.
+
+**Neden Nginx değil Caddy.** Nginx ile aynı sonucu almak için certbot +
+yenileme zamanlayıcısı + yenileme sonrası reload kancası + TLS blokları
+gerekirdi: dört ayrı hareketli parça, her biri sessizce bozulabilen ve
+bozulduğu gün sertifika süresi dolana kadar fark edilmeyen. Caddy sertifikayı
+kendisi alır, kendisi yeniler, HTTP'yi HTTPS'e kendisi yönlendirir.
+Yapılandırma da belirgin biçimde kısaldı: Nginx'te WebSocket için ayrı bir
+`location /ws` bloğu ve `Upgrade`/`Connection` başlıklarını elle set etmek
+gerekiyordu — unutulduğunda harita sürekli yeniden bağlanıyordu. Caddy'nin
+`reverse_proxy`'si bunu kendiliğinden yapar.
+
+`deploy/nginx.conf` silinmedi; TLS'siz bir kurulum ya da Caddy'nin uygun
+olmadığı bir ortam için referans olarak duruyor.
+
+**Alan adı isteğe bağlı, TLS kendiliğinden devreye giriyor.** Caddyfile'ın site
+adresi `{$PULSECITY_DOMAIN::80}` — alan adı verilmezse `:80`e düşer, yani eski
+Nginx davranışının aynısı. Alan adı tanımlandığı anda Caddy otomatik olarak
+sertifika alır ve HTTP'yi yönlendirir. Bu, kurulumu iki farklı yola bölmeden
+"domain'i olmayan da çalışsın" gereksinimini karşılıyor.
+
+**Sertifika kalıcılığı atlanabilecek bir tuzak.** Caddy sertifikayı ve ACME
+hesap anahtarını `/data` altında tutar. Named volume olmadan her
+`docker compose up --build` sertifikayı **sıfırdan** ister; Let's Encrypt'in
+"aynı sertifika" limiti haftada 5'tir ve birkaç deploy sonrası hafta boyu
+kilitlenirsin — geri dönüşü yok, beklemek zorundasın. `caddy-data` ve
+`caddy-config` volume'leri bunun için. Aynı sebeple Caddyfile'da `acme_ca`
+ortam değişkeninden okunuyor: test ederken staging'e alınabiliyor.
+
+**DNS adımı da otomatik.** DuckDNS token'ı SOPS ile şifrelenip depoda duruyor;
+cloud-init açılışta A kaydını sunucunun IP'sine yönlendiriyor. Elastic IP
+sabit olduğu için bu aslında tek seferlik, ama EIP kullanılmayan bir kurulumda
+her açılışta gerekli hale gelir. Faz 15'in altyapısı burada ikinci kez işe
+yaradı.
+
+**Terraform'da değişkenler arası kontrol.** `domain` verilip `acme_email`
+verilmezse Caddy sertifika alamaz. Terraform'un `validation` blokları yalnızca
+tek bir değişkene bakabildiği için bu çapraz kural orada ifade edilemiyor;
+`check` bloğu (Terraform 1.5+) bunu **plan aşamasında** yakalıyor — `apply`'dan
+sonra sertifikanın gelmemesini beklemek yerine.
+
+**Güvenlik başlıkları** eklendi: HSTS (1 yıl), `X-Content-Type-Options`,
+`X-Frame-Options`, `Referrer-Policy`, ve `Server` başlığının kaldırılması.
+Erişim logları JSON — Faz 13'te uygulama loglarını yapılandırmıştık, reverse
+proxy de aynı biçimde konuşsun ki tek bir log toplama hattı hepsini aynı
+şekilde işleyebilsin.
+
+**Ölçülen sonuçlar:** `caddy validate` iki modda da başarılı (alan adsız →
+*"listening only on the HTTP port"*; alan adıyla → *"enabling automatic
+HTTP→HTTPS redirects"*) · yönlendirme sahte backend'lerle uçtan uca test edildi
+(`/` → webviz, `/grafana/` → grafana) · güvenlik başlıkları yanıtta doğrulandı,
+`Server` başlığı kaldırılmış · `terraform validate` ve `trivy config` temiz.
+
+> HSTS'in bir yan etkisi var: tarayıcı bir kez aldıktan sonra o alan adına
+> HTTP ile gitmeyi bir yıl boyunca reddeder. HTTPS'ten geri dönmen gerekirse
+> önce `max-age=0` yayınlaman gerekir.
+
+### Faz 17 — Log Toplama (Loki + Promtail) ✅
+Metrikler *"ne kadar"*, loglar *"neden"* sorusunu yanıtlar. Faz 13'te üç Go
+servisi `log/slog` ile JSON'a, Faz 16'da Caddy de JSON erişim loguna geçmişti —
+bu faz o hazırlığın karşılığını alıyor.
+
+**Promtail Docker API'den keşif yapıyor** (`docker_sd_configs`), dosya tabanlı
+okuma yerine. Avantajı: konteyner etiketlerine erişebiliyoruz ve yeni
+konteynerler otomatik yakalanıyor. Bedeli, Docker soketine erişim — salt okunur
+bağlandı, ama soket üzerinden okuma yetkisi bile önemsiz değil; paylaşılan bir
+ortamda araya `docker-socket-proxy` gibi bir katman konmalı. Tek makine/tek
+operatör için kabul edilebilir.
+
+**JSON ayrıştırma yalnızca JSON yazan servislere uygulanıyor.** Kafka, ScyllaDB
+ve Prometheus düz metin yazar; onlara `json` stage uygulamak her satırda
+ayrıştırma hatası üretirdi. `match` selector'ı bunu ayırıyor.
+
+**`zone_id` bilerek etiket DEĞİL.** Loki log *içeriğini* indekslemez, yalnızca
+*etiketleri* indeksler; her benzersiz etiket kombinasyonu ayrı bir stream açar.
+Asıl gerekçe kardinalite de değil (9 değer sınırda kabul edilebilirdi):
+`zone_id` yalnızca *bazı* satırlarda var (anomali logları). Yalnızca bazı
+satırlarda bulunan bir alanı etiketlemek aynı servisin loglarını iki ayrı
+stream'e böler ve zaman sırası içinde okumayı zorlaştırır. Sorgu anında
+ayrıştırmak hem doğru hem yeterince hızlı:
+
+```logql
+{compose_service="consumer"} | json | zone_id="istanbul-uskudar"
+{compose_service="consumer", level="ERROR"}
+```
+
+Grafana'ya Loki datasource'u ve dashboard'a bir **log paneli** eklendi
+(`level=~"WARN|ERROR"`). Sorgu seviye *etiketine* göre filtrelediği için log
+içeriğini taramak zorunda kalmıyor.
+
+**Doğrulama sırasında yanıltıcı bir sonuç.** İlk kontrolde Loki'de yalnızca
+`grafana`, `kafka` ve `scylla` görünüyordu; üç Go servisi yoktu. İlk bakışta
+yapılandırma hatası gibi duruyor — ama değildi: Faz 13'te rutin log satırlarını
+(`batch işlendi`, saniyelik tur) `Debug` seviyesine indirmiştim ve varsayılan
+`LOG_LEVEL=info`. Yani o servisler açılıştan sonra **gerçekten hiç log
+yazmıyordu**; gönderilecek bir şey yoktu. Servisleri yeniden başlatınca
+loglar anında göründü.
+
+Bu, gözlemlenebilirlik kurarken kolay bir yanılgı: *boş panel* ile *bozuk
+boru hattı* aynı görünür. Ayırt etmenin yolu, kaynağın gerçekten veri üretip
+üretmediğini önce doğrulamak.
+
+**Saklama süresi** 7 gün. Aynı ders üçüncü kez: kalıcı disk eklenen her bileşen,
+politika yazılmazsa sınırsız büyür (Kafka → Faz 13, ScyllaDB → Faz 13, Loki →
+burada). Loki'de ek bir incelik var: `limits_config.retention_period` tek başına
+yetmez, `compactor.retention_enabled: true` de gerekir — yoksa politika yazılmış
+ama işletilmiyor olur.
+
+**Ölçülen sonuçlar:** Promtail 11 konteyneri keşfetti · `level` (INFO/ERROR) ve
+`service` etiketleri JSON'dan üretildi · `zone_id` etiket listesinde **yok**,
+ama `| json | zone_id="istanbul-uskudar"` sorgusu 3 stream döndürdü · ScyllaDB
+durdurularak gerçek `ERROR` üretildi ve dashboard panelinin sorgusu
+(`level=~"WARN|ERROR"`) eşleşen kayıtları getirdi.
+
+### Faz 18 — Blue-Green Deploy (alarm tabanlı rollback) ✅
+Faz 10'daki deploy job'ı `docker compose up -d --build` çalıştırıyordu: imaj
+yeniden derlenirken konteyner duruyor, kısa bir kesinti oluşuyordu. Bu faz onu
+kesintisiz hale getirir — ve bir adım öteye giderek **rollback kararını
+otomatikleştirir**.
+
+**Kapsam bilerek dar: yalnızca webviz.** Consumer zaten `--scale consumer=3`
+ile yatay ve Kafka consumer group'u rebalance'ı kendisi yönetiyor; bir replika
+inip kalktığında diğerleri devralıyor. Stateful bileşenler (Kafka, ScyllaDB)
+blue-green'e **hiç girmiyor** — iki kopya aynı veriyi paylaşamaz, "veritabanını
+da blue-green yapalım" bu mimaride anlamsız olurdu. Geriye gerçekten kesintisiz
+deploy'a ihtiyaç duyan tek katman kalıyor: kullanıcıya bakan taraf.
+
+**Geçiş bir konteyner işlemi, config değişikliği değil.** Caddy iki upstream'i
+birden tanıyor ve `lb_policy first` her zaman sıradaki **ilk sağlıklı**
+upstream'i seçiyor:
+
+```
+ikisi de ayakta  →  trafik webviz'de (blue)
+blue durdurulur  →  trafik webviz-green'e geçer
+blue geri gelir  →  trafik blue'ya döner (rollback)
+```
+
+Caddy yapılandırması hiç değişmiyor, reload yok, üretilen dosya yok. Sağlık
+kontrolü `/readyz`e vurduğu için yeni sürüm hazır olmadan trafik almıyor —
+Faz 12'de eklenen readiness sondası burada ikinci kez işe yarıyor.
+
+`webviz-green` normalde **çalışmıyor**; compose `bluegreen` profili arkasında
+duruyor ve yalnızca deploy sırasında ayağa kalkıyor. Ayrı bir consumer group
+kullanıyor (`pulsecity-webviz-green`) — aynı group'u paylaşsalardı Kafka
+partition'ları ikiye böler ve her iki harita da akışın yalnızca yarısını
+görürdü.
+
+**Asıl nokta: rollback kararı alarma dayanıyor.** Geçişten sonra bir gözlem
+penceresi boyunca üç şey izleniyor: Alertmanager'da `critical` alarm çıktı mı,
+green sağlıklı kaldı mı, ve green **gerçekten Kafka'dan okuyor mu**
+(`pulsecity_webviz_messages_consumed_total` artıyor mu). Üçüncüsü önemli —
+ayakta ama sessizce boş harita servis eden bir sürüm, en sinsi başarısızlık
+biçimidir; sağlık kontrolü onu yakalamaz.
+
+Bu, Faz 13'teki alarm zinciri olmadan **yapılamazdı**. "Kötü gidiyor"un makine
+tarafından okunabilir bir tanımı olmadan otomatik rollback, tahmin olurdu.
+P1 sıralamasında blue-green'in en sona bırakılmasının sebebi buydu.
+
+**Ön kontrol de var:** dağıtımdan *önce* critical alarm varsa betik hiç
+başlamıyor. Bozuk bir sistemin üzerine deploy etmek, rollback kararını da
+anlamsız kılar — neyin bozulduğu ayırt edilemez.
+
+**Son adım bilerek otomatik değil.** Gözlem penceresi temiz geçtiğinde green
+trafiği taşımaya devam ediyor ama adı hâlâ `webviz-green`. Kalıcı hale getirmek
+(blue'yu yeni imajla yeniden kurup green'i durdurmak) kısa bir kesinti içerir
+ve ne zaman yapılacağına operatör karar vermeli; asıl amaç olan **doğrulama**
+zaten tamamlanmış oluyor.
+
+```bash
+./scripts/deploy-webviz.sh 60    # 60sn gözlem penceresi
+```
+
+**Ölçülen sonuçlar.** Geçiş sırasında 150ms aralıkla istek atılarak kesinti
+ölçüldü: **95 istek, 95× HTTP 200, sıfır başarısız.** Blue `exit 0` ile
+kapandı (Faz 12'nin graceful shutdown'ı). Rollback ayrıca test edildi —
+gözlem penceresi ortasında green `docker kill` ile öldürüldü; betik durumu
+yakaladı, blue'yu geri getirdi, servis 200'e döndü.
+
+#### Test sırasında bulunan dört hata
+
+Bu fazın asıl değeri, betiği *yazmak* değil çalıştırıp kırılma noktalarını
+bulmaktı. Dördü de gerçek deploy'da ortaya çıkacak türdendi:
+
+**1. Betik sunucuda hiç çalışmazdı.** Prometheus ve Alertmanager'ı
+`localhost:9090`/`9093` üzerinden sorguluyordu, ama prod override o portları
+dışa açmıyor (`ports: []`). Sorgular `docker exec` ile konteynerin kendi
+içinden yapılacak şekilde değiştirildi.
+
+**2. Alarm yokken çöküyordu.** `critical_alerts()` içindeki `grep`, eşleşme
+bulamayınca 1 döner ve `set -o pipefail` altında tüm boru hattını başarısız
+kılar. Yani **"hiç alarm yok"** — asıl beklenen ve istenen durum — betiği ön
+kontrolde sessizce sonlandırıyordu. `{ grep || true; }` ile kapatıldı.
+
+**3. En ciddisi: sistemi tamamen kapalı bırakıyordu.** Prometheus erişilemez
+olduğunda `promq` non-zero dönüyor, `set -e` betiği gözlem döngüsünün ilk
+adımında öldürüyordu — **blue durdurulmuş, green doğrulanmamış, ortada servis
+veren hiçbir şey kalmamış** halde. Testte tam olarak bu oldu ve servis 503'e
+düştü. Bir deploy betiğinin yapabileceği en kötü şey bu.
+
+Düzeltme iki katmanlı: `promq` dayanıklı hale getirildi **ve** blue
+durdurulduktan sonra devreye giren bir `trap on_exit EXIT` eklendi. Artık
+betik *nasıl* ölürse ölsün (bir komut hatası, Ctrl-C, kill) blue geri geliyor.
+Doğrulama mantığını düzeltmek tek başına yeterli değildi — sistemin ayakta
+kalması betiğin doğru çalışmasına bağlı olmamalı.
+
+**4. Caddy'nin "alan adı opsiyonel" davranışı yanlıştı.** `{$VAR:default}`
+sözdizimi yalnızca değişken **tanımsızsa** varsayılanı kullanır; **tanımlı ama
+boşsa** boş değeri alır. `.env`'de `PULSECITY_DOMAIN=` satırı (domain'siz
+kurulum) tam bu duruma düşüyor ve boş site adresi Caddyfile'da global options
+bloğu gibi okunuyordu:
+
+```
+Error: server block without any key is global configuration,
+       and if used, it must be first
+```
+
+Yani domain'siz her kurulumda Caddy hiç başlamazdı. Compose tarafında `:-`
+kullanılarak düzeltildi (`${PULSECITY_DOMAIN:-:80}`) — compose'un `:-` operatörü
+hem tanımsızı hem boşu yakalar.
+
+#### Ayrıca: prod bellek bütçesi taşmıştı
+
+Test sırasında ScyllaDB `insufficient physical memory` ile ayağa kalkmadı.
+Sebebi local kaynak sıkışıklığıydı ama araştırınca gerçek bir sorun çıktı:
+prod profilinin toplam bellek limiti **8.38 GB**'a ulaşmıştı — hedef instance
+t3.large'ın (8 GB) **tamamından fazla**, işletim sistemine hiç pay bırakmadan.
+
+Faz 6'da doğru boyutlandırılmıştı; sonraki fazlar servis ekledi ama kimse
+bütçeyi yeniden hesaplamadı (Faz 13 → alertmanager + kafka-exporter, Faz 17 →
+loki + promtail). Local'de kimse prod profilini çalıştırmadığı için görünmüyordu.
+
+Yeniden hesaplandı ve **7.25 GB**'a indirildi: Kafka 1.5G→1280M, ScyllaDB
+limiti 2.5G→2G (bayrağıyla artık tutarlı; önceden limit 2.5G, `--memory` 2000M
+idi), consumer 3→2 replika, Caddy'ye limit eklendi (hiç yoktu). Bütçe tablosu
+`deploy/docker-compose.prod.yml` başına yazıldı. Bunun bir **hesap** olduğu,
+ölçüm olmadığı ayrıca not edildi — gerçek sunucuda `docker stats` ile
+doğrulanmalı.
+
 ## Sonuçları doğrulama sırası
 
 Projeyi baştan sona kendi ortamında doğrulamak istersen:
@@ -585,7 +830,6 @@ docker compose logs -f producer consumer
 - Multi-region / multi-datacenter dağıtım yok
 - Kubernetes yok (bu ölçekte overkill; Docker Compose + tek VPS yeterli)
 - Karmaşık stream-processing (windowing, join, CEP) yok — ayrı bir proje fikri olarak değerlendirildi
-- TLS/HTTPS henüz yok (Faz 6'da not edildi, gerçek domain ile kolayca eklenebilir)
 - Kafka/ScyllaDB tek node (RF=1) — production-grade bir kurulumda RF=3 + multi-broker gerekir
 - `ping_time` milisaniye hassasiyetinde saklanır; aynı aracın aynı milisaniyedeki iki
   ping'i tek satıra iner (~%7). Boru hattı bunları kaybetmez (Kafka'da ve DLQ hesabında
