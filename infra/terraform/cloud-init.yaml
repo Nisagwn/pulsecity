@@ -39,6 +39,39 @@ write_files:
       APP_DIR=/opt/${project_name}
       cd "$APP_DIR"
 
+      # --- SOPS ile depodaki sirlari coz (Faz 15) ---
+      #
+      # age ozel anahtari SSM'de. Bos ise (age_private_key degiskeni
+      # verilmemisse) bu adim atlanir ve sistem Slack bildirimi olmadan
+      # calisir - sir yonetimi opsiyonel bir katman, kritik yol degil.
+      AGE_KEY="$(aws ssm get-parameter \
+        --name '${age_ssm_path}' \
+        --with-decryption \
+        --region '${aws_region}' \
+        --query 'Parameter.Value' \
+        --output text 2>/dev/null || true)"
+
+      if [ -n "$AGE_KEY" ] && [ "$AGE_KEY" != "None" ]; then
+        mkdir -p /root/.config/sops/age "$APP_DIR/secrets/decrypted"
+        umask 077
+        printf '%s\n' "$AGE_KEY" > /root/.config/sops/age/keys.txt
+
+        for enc in "$APP_DIR"/secrets/*.enc; do
+          [ -e "$enc" ] || continue
+          out="$APP_DIR/secrets/decrypted/$(basename "$enc" .enc)"
+          if SOPS_AGE_KEY_FILE=/root/.config/sops/age/keys.txt \
+             sops --decrypt "$enc" > "$out" 2>/dev/null; then
+            echo "coz: $(basename "$enc") -> $(basename "$out")"
+          else
+            echo "UYARI: cozulemedi: $enc" >&2
+            rm -f "$out"
+          fi
+        done
+        chmod 600 "$APP_DIR"/secrets/decrypted/* 2>/dev/null || true
+      else
+        echo "age anahtari yok - SOPS adimi atlandi"
+      fi
+
       # Grafana parolasi SSM'den, instance'in KENDI IAM rolüyle okunuyor.
       # Deposunda ya da user-data'da duz metin olarak durmuyor.
       GRAFANA_PASSWORD="$(aws ssm get-parameter \
@@ -75,6 +108,10 @@ runcmd:
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
   - apt-get update
   - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  # --- sops (Faz 15: depodaki sirlari cozmek icin) ---
+  - curl -fsSL -o /usr/local/bin/sops https://github.com/getsops/sops/releases/download/v3.9.0/sops-v3.9.0.linux.amd64
+  - chmod +x /usr/local/bin/sops
   - usermod -aG docker ubuntu
   - systemctl enable --now docker
 

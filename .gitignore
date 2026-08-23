@@ -45,3 +45,18 @@ crash.*.log
 *.tfvars
 *.tfvars.json
 !*.tfvars.example
+
+# --- SOPS / age (Faz 15) ---
+# age OZEL anahtarlari. Bunlardan biri depoya girerse secrets/ altindaki her
+# sey okunabilir hale gelir - sifrelemenin tamami anlamsizlasir.
+*.agekey
+age-key.txt
+keys.txt
+
+# Deploy sirasinda uretilen COZULMUS sirlar. secrets/*.enc commit edilir,
+# bunlar asla.
+secrets/decrypted/
+
+# secrets/ altindaki sifreli dosyalar BILEREK ignore EDILMIYOR - amac onlarin
+# surumlenmesi. `./scripts/secrets.sh check` yanlislikla duz metin commit
+# edilmedigini dogrular (CI'da da kosar).

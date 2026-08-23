@@ -86,6 +86,27 @@ variable "allowed_http_cidr" {
   default     = "0.0.0.0/0"
 }
 
+variable "age_private_key" {
+  description = <<-EOT
+    SOPS age OZEL anahtari (AGE-SECRET-KEY-1... ile baslar). Sunucu depodaki
+    sifreli sirlari (secrets/*.enc) bununla cozer.
+
+    Bos birakilirsa SOPS akisi devre disi kalir - Slack bildirimi olmadan da
+    sistem calisir. Doldurmak icin:
+      grep AGE-SECRET-KEY ~/.config/sops/age/keys.txt
+
+    Bu deger Terraform state'ine DUZ METIN yazilir; state .gitignore'dadir.
+  EOT
+  type        = string
+  default     = ""
+  sensitive   = true
+
+  validation {
+    condition     = var.age_private_key == "" || can(regex("^AGE-SECRET-KEY-1", var.age_private_key))
+    error_message = "age OZEL anahtari AGE-SECRET-KEY-1 ile baslamali. Acik anahtari (age1...) degil, ozel anahtari ver."
+  }
+}
+
 variable "ssh_public_key" {
   description = "Sunucuya yetkilendirilecek SSH acik anahtari (ssh-ed25519 ... biciminde)."
   type        = string

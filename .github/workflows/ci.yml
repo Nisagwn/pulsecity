@@ -44,6 +44,37 @@ jobs:
       - name: Derleme
         run: go build ./...
 
+  # --- 1b) Sır hijyeni ----------------------------------------------------
+  #
+  # secrets/ altındaki dosyaların gerçekten şifreli olduğunu doğrular.
+  # SOPS'un asıl kırılganlığı şifrelemenin kendisi değil, bir dosyanın
+  # şifrelenmeyi UNUTULMASIDIR — bu iş tek bir `git add` ile sessizce ters
+  # gidebilir. Bu koruma onu yayına çıkmadan yakalar.
+  secrets-hygiene:
+    name: Sır hijyeni
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Şifrelenmemiş sır var mı
+        run: ./scripts/secrets.sh check
+
+      - name: age özel anahtarı sızmış mı
+        run: |
+          # .gitignore koruma sağlar ama `git add -f` onu atlar; bu son savunma.
+          #
+          # Kalıp anahtarın BİÇİMİNE bakıyor, sadece "AGE-SECRET-KEY" dizesine
+          # değil: gerçek bir age özel anahtarı bu önekten sonra ~59 karakter
+          # daha taşır. Salt önek araması, dokümantasyondaki ve Terraform
+          # validation'ındaki meşru referansları da yakalayıp yanlış alarm
+          # üretiyordu — sürekli yanlış alarm veren bir koruma, kapatılan bir
+          # korumadır.
+          if git grep -nIE "AGE-SECRET-KEY-1[A-Z0-9]{50,}" -- .; then
+            echo "HATA: depoda age ÖZEL anahtarı bulundu!"
+            exit 1
+          fi
+          echo "age özel anahtarı sızıntısı yok."
+
   # --- 2) Unit testler ----------------------------------------------------
   test:
     name: Test (${{ matrix.module }})

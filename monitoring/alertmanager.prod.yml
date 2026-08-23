@@ -1,0 +1,71 @@
+# PulseCity — Alertmanager (production)
+#
+# Faz 13'te bildirim kanali BOS birakilmisti: gercek bir Slack webhook'u
+# depoya duz metin yazilamaz. Faz 15'te SOPS bu boslugu kapatiyor.
+#
+# Webhook URL'si BU DOSYADA DEGIL. `slack_api_url_file` ile bir dosyadan
+# okunuyor; o dosya deploy sirasinda SOPS ile cozuluyor
+# (secrets/slack_api_url.enc -> secrets/decrypted/slack_api_url).
+#
+# Neden `slack_api_url` degil de `_file`:
+# Alertmanager yapilandirmasi ortam degiskeni ikamesi DESTEKLEMEZ. URL'yi
+# dogrudan yazmak, dosyanin tamamini sifrelemeyi gerektirirdi - o zaman da
+# gruplama/inhibition mantigi depoda okunamaz hale gelir ve inceleyen kisi
+# alarm politikasini goremezdi. `_file` ile politika ACIK, yalnizca SIR gizli.
+#
+# Local ve CI bu dosyayi KULLANMAZ (monitoring/alertmanager.yml kullanilir);
+# yalnizca deploy/docker-compose.prod.yml bunu bagliyor. Boylece Slack
+# yapilandirilmamis bir ortamda Alertmanager, olmayan bir dosya yuzunden
+# baslangicta hata vermez.
+
+# Cozulmus dosya YALNIZCA URL satirini icermeli - Alertmanager dosyanin
+# tamamini URL olarak okur, yorum satiri kabul etmez.
+global:
+  slack_api_url_file: /etc/alertmanager/secrets/slack_api_url
+
+route:
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  receiver: "slack-default"
+
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: "slack-critical"
+      group_wait: 10s
+      repeat_interval: 1h
+
+inhibit_rules:
+  - source_matchers:
+      - alertname = "ServisKapali"
+    target_matchers:
+      - severity = "warning"
+    equal: ["instance"]
+
+  - source_matchers:
+      - alertname = "ConsumerScyllaBaglantisiYok"
+    target_matchers:
+      - alertname = "DLQDoluyor"
+
+receivers:
+  - name: "slack-default"
+    slack_configs:
+      - channel: "#pulsecity-alerts"
+        send_resolved: true
+        title: "{{ .Status | toUpper }} — {{ .CommonLabels.alertname }}"
+        text: >-
+          {{ range .Alerts }}{{ .Annotations.description }}
+          {{ end }}
+
+  - name: "slack-critical"
+    slack_configs:
+      - channel: "#pulsecity-alerts"
+        send_resolved: true
+        # critical olanlar kanalda dikkat cekmeli.
+        title: ":rotating_light: {{ .Status | toUpper }} — {{ .CommonLabels.alertname }}"
+        text: >-
+          {{ range .Alerts }}{{ .Annotations.description }}
+          {{ end }}

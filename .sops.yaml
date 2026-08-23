@@ -1,0 +1,46 @@
+# SOPS yapilandirmasi (Faz 15)
+#
+# --- SOPS ve SSM neden IKISI birden var ---
+#
+# Faz 14'te Grafana parolasi AWS SSM Parameter Store'a konmustu. SOPS onun
+# yerine gecmiyor; farkli bir problemi cozuyor. Ayrim su:
+#
+#   SSM  -> MAKINE tarafindan uretilen, calisma zamaninda okunan sirlar.
+#           Terraform uretir, kimse gormez, rotasyonu bir `terraform apply`.
+#           Ornek: Grafana admin parolasi.
+#
+#   SOPS -> OPERATOR tarafindan saglanan, SURUM KONTROLUNDE durmasi gereken
+#           yapilandirma. Bir Slack webhook'u ya da ucuncu parti API anahtari
+#           "uretilmez", disaridan alinir; ve hangi surumun hangi degerle
+#           calistigi git gecmisinden okunabilmelidir.
+#           Ornek: Alertmanager'in Slack webhook URL'si.
+#
+# Ikisini birlestiren tek nokta: age OZEL ANAHTARI SSM'de duruyor. Yani
+# sunucunun bilmesi gereken tek bootstrap sirri o; geri kalan her sey depoda,
+# sifreli ve surumlenmis halde.
+#
+# --- Anahtar kurulumu ---
+#
+#   ./scripts/secrets.sh init
+#
+# Bu komut bir age anahtar cifti uretir, ACIK anahtari asagidaki `age:`
+# alanina yazar ve OZEL anahtari ~/.config/sops/age/keys.txt icine koyar.
+# Ozel anahtar ASLA depoya girmez (.gitignore'da).
+
+creation_rules:
+  # secrets/ altindaki her sey sifrelenir.
+  - path_regex: ^secrets/.*\.enc(\.[a-z]+)?$
+    key_groups:
+      - age:
+          # BURAYI KENDI ACIK ANAHTARINLA DEGISTIR (./scripts/secrets.sh init
+          # bunu otomatik yapar). Birden fazla kisi calisacaksa her birinin
+          # acik anahtari ayri satir olarak eklenir - SOPS dosyayi hepsine
+          # birden sifreler, yani ortak bir parola paylasilmaz.
+          - age1PLACEHOLDER0000000000000000000000000000000000000000000000000
+
+  # YAML/JSON dosyalarinda yalnizca DEGERLER sifrelenir, anahtarlar acik kalir.
+  # Bu bilincli: `git diff` hangi alanin degistigini gosterebilsin, tum dosya
+  # tek bir okunamaz blob'a donusmesin.
+  #
+  # `unencrypted_regex` yerine varsayilan davranis kullaniliyor; sops zaten
+  # anahtarlari duz birakir.
