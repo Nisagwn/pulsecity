@@ -532,10 +532,25 @@ cp secrets/slack_api_url.example secrets/slack_api_url.enc
 ./scripts/secrets.sh check                    # CI'nın koştuğu kontrol
 ```
 
+**Push protection'ın yakaladığı ve derinlemesine savunma.** İlk denemede push
+**reddedildi**: GitHub Push Protection, `secrets/slack_api_url.example`
+içindeki *örnek* webhook URL'sini gerçek bir Slack webhook'u sandı. Haklıydı —
+bir şablon ile gerçeği ayırt edemez, kalıp fazla gerçekçiydi.
+
+İki ders çıktı. Birincisi, **kendi CI kontrolüm bunu yakalamazdı**: o yalnızca
+age anahtarlarına ve SOPS şifrelemesine bakıyor, Slack webhook kalıbına değil.
+Farklı katmanlar farklı şeyleri yakalıyor. İkincisi, doğru çözüm GitHub'ın
+sunduğu *"allow secret"* bağlantısını kullanmak **değildi** — o, sahte bir
+sırrı kalıcı olarak beyaz listeye alır ve bir sonraki gerçek sızıntıda aynı
+refleksi yaratır. Örnek adres `hooks.slack.invalid` olarak değiştirildi:
+kalıba uymuyor, `.invalid` ayrılmış bir TLD ve şablon olduğu bakar bakmaz
+belli.
+
 **Ölçülen sonuçlar:** şifrele/çöz turu doğrulandı (şifreli hal `ENC[AES256_GCM,…]`,
 anahtarla çözülüyor, **anahtarsız çözme başarısız — exit 128**) · sızıntı koruması
 iki yönde test edildi (temiz depoda susuyor, gerçek anahtar eklenince yakalıyor) ·
-`amtool check-config` prod yapılandırmasında başarılı · `terraform validate` başarılı.
+`amtool check-config` prod yapılandırmasında başarılı · `terraform validate` başarılı ·
+GitHub Push Protection tetiklendi ve düzgün biçimde çözüldü.
 
 ## Sonuçları doğrulama sırası
 
