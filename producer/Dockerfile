@@ -9,7 +9,7 @@
 # Bedeli: digest sabit oldugu icin base imaj guvenlik yamalari OTOMATIK gelmez.
 # Bu yuzden .github/dependabot.yml digest'leri haftalik olarak PR ile gunceller -
 # yama akisi kaybolmaz, sadece gorunur ve gozden gecirilebilir hale gelir.
-FROM golang:1.26-alpine@sha256:28d89ee9cc0ff9fec75c82ca201e6bf7fdf9a679d4b7b24dfa04f2bb766bb468 AS build
+FROM golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS build
 WORKDIR /app
 # Bagimliliklar once kopyalanir: kod degistiginde bu katman onbellekten gelir,
 # modul indirme her build'de tekrarlanmaz. Ayrica go.sum sayesinde build
