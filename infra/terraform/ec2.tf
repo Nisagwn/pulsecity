@@ -85,6 +85,7 @@ resource "aws_instance" "app" {
     repo_branch      = var.repo_branch
     aws_region       = var.aws_region
     grafana_ssm_path = aws_ssm_parameter.grafana_admin_password.name
+    age_ssm_path     = var.age_private_key == "" ? "" : aws_ssm_parameter.age_private_key[0].name
   })
 
   tags = {

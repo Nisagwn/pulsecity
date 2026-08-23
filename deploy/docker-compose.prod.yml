@@ -67,6 +67,13 @@ services:
   alertmanager:
     restart: unless-stopped
     ports: []   # dışa kapalı; arayüzüne SSH tüneli ile bakılır
+    volumes:
+      # Prod'da Slack alıcısı olan yapılandırma kullanılır. Webhook URL'si bu
+      # dosyada DEĞİL — `slack_api_url_file` ile aşağıdaki dizinden okunuyor.
+      - ./monitoring/alertmanager.prod.yml:/etc/alertmanager/alertmanager.yml:ro
+      # SOPS ile çözülmüş sırlar. Bu dizin .gitignore'da ve deploy sırasında
+      # üretiliyor (bkz. scripts/deploy-secrets.sh, cloud-init).
+      - ./secrets/decrypted:/etc/alertmanager/secrets:ro
     deploy:
       resources:
         limits:

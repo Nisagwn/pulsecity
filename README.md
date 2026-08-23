@@ -477,6 +477,81 @@ başarılı · `trivy config` **0 bulgu** (bir istisna gerekçeli).
 
 Ayrıntı ve maliyet notları: [`infra/terraform/README.md`](infra/terraform/README.md).
 
+### Faz 15 — Sır Yönetimi (SOPS + age) ✅
+Faz 13'te Alertmanager'ın bildirim kanalı boş bırakılmıştı: *"gerçek bir Slack
+webhook'u bu depoya sabit yazılamaz."* Faz 14 çalışma zamanı sırlarını SSM ile
+çözdü. Bu faz kalan boşluğu kapatır — **depoda durması gereken** sırlar.
+
+**İkisi neden birlikte var.** SOPS, SSM'in yerine geçmiyor; farklı bir problemi
+çözüyor:
+
+| | SSM Parameter Store | SOPS + age |
+|---|---|---|
+| Ne tutar | **Makine** tarafından üretilen sırlar | **Operatör** tarafından sağlanan yapılandırma |
+| Örnek | Grafana admin parolası (Terraform üretir, kimse görmez) | Slack webhook URL'si (dışarıdan alınır) |
+| Rotasyon | `terraform apply` | Yeni değeri şifrele, commit et |
+| Sürüm geçmişi | Yok | **Var** — hangi sürüm hangi değerle çalıştı, git'ten okunur |
+
+Birleştikleri tek nokta: **age özel anahtarı SSM'de duruyor.** Sunucunun bilmesi
+gereken tek bootstrap sırrı o; geri kalan her şey depoda, şifreli ve
+sürümlenmiş. Bu, "her sır için bir SSM parametresi" yaklaşımından iyi — her yeni
+sır için `terraform apply` gerekmez, değişiklik git geçmişinde görünür ve gözden
+geçirilir.
+
+**Alertmanager'da `slack_api_url` değil `slack_api_url_file`.** Alertmanager
+yapılandırması ortam değişkeni ikamesi desteklemez. URL'yi doğrudan yazmak
+dosyanın tamamını şifrelemeyi gerektirirdi — o zaman da gruplama ve inhibition
+mantığı depoda okunamaz hale gelir, inceleyen kişi alarm politikasını göremezdi.
+`_file` ile **politika açık, yalnızca sır gizli**. Prod overlay'i
+(`monitoring/alertmanager.prod.yml`) yalnızca `deploy/docker-compose.prod.yml`
+tarafından bağlanır; böylece Slack yapılandırılmamış bir ortamda Alertmanager
+olmayan bir dosya yüzünden başlangıçta hata vermez.
+
+**Asıl değer şifrelemede değil, koruma katmanında.** SOPS'un kırılgan yanı
+şifrelemenin kendisi değil, bir dosyanın şifrelenmeyi **unutulmasıdır** — tek
+bir `git add` ile sessizce ters gider. CI'daki `secrets-hygiene` job'ı iki şeyi
+doğrular: `secrets/` altındaki her dosya gerçekten şifreli mi, ve depoda bir age
+**özel** anahtarı var mı.
+
+Bu ikinci kontrol ilk yazılışında **yanlış alarm verdi**: salt `AGE-SECRET-KEY`
+dizesini arıyordu ve Terraform'un `validation` bloğundaki meşru referansı da
+yakalıyordu. Kalıp anahtarın *biçimine* göre daraltıldı
+(`AGE-SECRET-KEY-1[A-Z0-9]{50,}`) — sürekli yanlış alarm veren bir koruma,
+kapatılan bir korumadır.
+
+**Kapsam bilerek dar tutuldu.** İlk taslakta `secrets/prod.env.enc` de vardı;
+çıkarıldı, çünkü o değerleri cloud-init zaten SSM'den üretiyordu — SOPS'a
+koymak sahte bir karmaşıklık olurdu. Şu an SOPS iki gerçek işi yapıyor: Slack
+webhook'u ve `terraform.tfvars` (içinde operatörün IP'si var, `.gitignore`'da
+olduğu için altyapının hangi değerlerle kurulduğu hiçbir yerde kayıtlı değildi).
+
+```bash
+./scripts/secrets.sh init                     # age anahtarı üret, .sops.yaml'a yaz
+cp secrets/slack_api_url.example secrets/slack_api_url.enc
+./scripts/secrets.sh encrypt secrets/slack_api_url.enc
+./scripts/secrets.sh check                    # CI'nın koştuğu kontrol
+```
+
+**Push protection'ın yakaladığı ve derinlemesine savunma.** İlk denemede push
+**reddedildi**: GitHub Push Protection, `secrets/slack_api_url.example`
+içindeki *örnek* webhook URL'sini gerçek bir Slack webhook'u sandı. Haklıydı —
+bir şablon ile gerçeği ayırt edemez, kalıp fazla gerçekçiydi.
+
+İki ders çıktı. Birincisi, **kendi CI kontrolüm bunu yakalamazdı**: o yalnızca
+age anahtarlarına ve SOPS şifrelemesine bakıyor, Slack webhook kalıbına değil.
+Farklı katmanlar farklı şeyleri yakalıyor. İkincisi, doğru çözüm GitHub'ın
+sunduğu *"allow secret"* bağlantısını kullanmak **değildi** — o, sahte bir
+sırrı kalıcı olarak beyaz listeye alır ve bir sonraki gerçek sızıntıda aynı
+refleksi yaratır. Örnek adres `hooks.slack.invalid` olarak değiştirildi:
+kalıba uymuyor, `.invalid` ayrılmış bir TLD ve şablon olduğu bakar bakmaz
+belli.
+
+**Ölçülen sonuçlar:** şifrele/çöz turu doğrulandı (şifreli hal `ENC[AES256_GCM,…]`,
+anahtarla çözülüyor, **anahtarsız çözme başarısız — exit 128**) · sızıntı koruması
+iki yönde test edildi (temiz depoda susuyor, gerçek anahtar eklenince yakalıyor) ·
+`amtool check-config` prod yapılandırmasında başarılı · `terraform validate` başarılı ·
+GitHub Push Protection tetiklendi ve düzgün biçimde çözüldü.
+
 ## Sonuçları doğrulama sırası
 
 Projeyi baştan sona kendi ortamında doğrulamak istersen:

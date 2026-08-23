@@ -1,0 +1,46 @@
+# Satir sonu ve dosya turu normallestirmesi.
+#
+# NEDEN VAR: bu depo Windows'ta gelistiriliyor, CI ise Linux'ta kosuyor.
+# Iki tuzak bu farktan dogdu:
+#
+# 1. Calistirilabilirlik biti. Windows'ta `core.fileMode=false` oldugu icin
+#    yerelde yapilan `chmod +x` git'e YANSIMAZ; scriptler 100644 olarak
+#    commit edilir ve Linux runner'da "Permission denied" (exit 126) verir.
+#    Asagidaki `text eol=lf` bunu kendi basina cozmez - calistirilabilirlik
+#    biti `git update-index --chmod=+x` ile ayarlanir - ama satir sonu
+#    normallestirmesi ikinci tuzagi kapatir:
+#
+# 2. CRLF satir sonu. Bir kabuk betigi CRLF ile Linux'a giderse `#!/bin/bash\r`
+#    yorumlanamaz ve "bad interpreter" hatasi verir. Ayni sekilde CRLF'li
+#    Dockerfile ve YAML dosyalari da beklenmedik bicimde davranabilir.
+#
+# `text eol=lf`: depoda ve calisma kopyasinda LF zorlanir.
+
+# Varsayilan: metin dosyalarini otomatik algila, depoda LF olarak sakla.
+* text=auto eol=lf
+
+# Kabuk betikleri ve konteyner/CI dosyalari KESINLIKLE LF olmali.
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.tf        text eol=lf
+*.cql       text eol=lf
+Dockerfile  text eol=lf
+*.Dockerfile text eol=lf
+
+# Go kaynak dosyalari: gofmt LF uretir, CI'daki `gofmt -l` kontrolu de
+# LF bekler.
+*.go        text eol=lf
+go.mod      text eol=lf
+go.sum      text eol=lf
+
+# Windows'a ozgu betikler CRLF kalmali.
+*.bat       text eol=crlf
+*.ps1       text eol=crlf
+
+# Ikili dosyalar hic dokunulmasin.
+*.png       binary
+*.jpg       binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary

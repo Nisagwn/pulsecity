@@ -37,6 +37,31 @@ resource "aws_ssm_parameter" "grafana_admin_password" {
   }
 }
 
+# --- age ozel anahtari (Faz 15) --------------------------------------------
+#
+# Sunucunun bilmesi gereken TEK bootstrap sirri budur. Geri kalan her sey
+# (Slack webhook'u vb.) depoda, SOPS ile sifreli ve surumlenmis halde durur;
+# sunucu onlari bu anahtarla cozer.
+#
+# Bu, "her sir icin bir SSM parametresi" yaklasimindan daha iyi: her yeni sir
+# icin bir `terraform apply` gerekmez, degisiklikler git gecmisinde gorunur ve
+# gozden gecirilir. SSM yalnizca zinciri baslatan anahtari tasir.
+#
+# Deger BOS birakilabilir (varsayilan): o durumda SOPS akisi devre disidir ve
+# cloud-init sir cozmeyi atlar. Slack bildirimi istendiginde doldurulur.
+resource "aws_ssm_parameter" "age_private_key" {
+  count = var.age_private_key == "" ? 0 : 1
+
+  name        = "/${var.project_name}/sops/age_private_key"
+  description = "PulseCity SOPS age ozel anahtari - depodaki sirlari cozmek icin"
+  type        = "SecureString"
+  value       = var.age_private_key
+
+  tags = {
+    Name = "${var.project_name}-age-private-key"
+  }
+}
+
 # --- Instance rolu ----------------------------------------------------------
 
 data "aws_iam_policy_document" "ec2_assume" {
@@ -72,7 +97,11 @@ data "aws_iam_policy_document" "ssm_read" {
       "ssm:GetParameters",
     ]
 
-    resources = [aws_ssm_parameter.grafana_admin_password.arn]
+    # Yalnizca bu iki parametre - projenin tum yolu (/pulsecity/*) bile degil.
+    resources = concat(
+      [aws_ssm_parameter.grafana_admin_password.arn],
+      aws_ssm_parameter.age_private_key[*].arn,
+    )
   }
 
   # SecureString'i cozmek icin KMS izni de gerekir. AWS yonetimli
