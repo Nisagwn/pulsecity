@@ -41,8 +41,24 @@
 # `--memory 1500M` ile sınırlı, yani 3G tavanına hiç yaklaşmaz; tavan
 # seastar'ın pay hesabını doğru yapabilmesi için var).
 #
-# ÖLÇÜM, hesap değil - `docker stats` ile gerçek kullanım:
-#   (bu satır ilk ölçümden sonra doldurulacak)
+# ÖLÇÜM, hesap değil - `docker stats` ile gerçek kullanım (m7i-flex.large,
+# 50.000 msg/sn yükü altında, 2026-08-29):
+#
+#   scylla 1.40G/3G · kafka 989M/1.25G · loki 109M/512M · grafana 81M/512M
+#   producer 56M/512M · prometheus 35M/512M · alertmanager 36M/128M
+#   promtail 26M/128M · consumer 15M+14M/512M · webviz 15M/512M
+#   caddy 12M/128M · kafka-exporter 7M/128M
+#   ------------------------------------------------------------------
+#   HOST TOPLAM 2.8 GB / 7.6 GB  -> tavanların toplamı 8.25 GB olsa da
+#   gerçek kullanım bunun ÜÇTE BİRİ. Tavan-toplamı endişesi pratikte yok.
+#
+# Limitine en çok yaklaşan Kafka (%77). Küçültülecek ilk yer orası DEĞİL;
+# gevşetilecek yer orası. Grafana/Prometheus/Loki limitlerinin %20'sinin
+# altında - istenirse oradan 1 GB'a yakın yer açılabilir.
+#
+# CPU ise DOLU: aynı ölçümde scylla %63, kafka %52, webviz %40, producer %20,
+# consumer'lar %17 - toplam ~%191 / %200 (2 vCPU). Darboğaz bellek değil CPU,
+# ve asıl sınırlayıcı ScyllaDB'nin yazma hızı.
 #
 # Sıkışıklık görülürse ilk kısılacak yer Grafana, Prometheus ve Loki: üçü de
 # demo yükünde limitlerinin çok altında çalışır.
