@@ -57,6 +57,46 @@ variable "root_volume_size_gb" {
   }
 }
 
+# --- Yuk profili ------------------------------------------------------------
+#
+# NEDEN DEGISKEN OLARAK BURADA: deploy/docker-compose.prod.yml'in varsayilani
+# 50.000 msg/sn'dir ve cloud-init .env'e bu degeri YAZMADIGI surece o
+# varsayilan devreye girer. 50k rakami Faz 3'te 12 CEKIRDEK / 7,6 GB ile
+# olculmustu; t3.large 2 vCPU'dur ve prod profili producer'a 0.5, iki
+# consumer'a 0.5'er CPU limiti koyar.
+#
+# Bu hizi t3.large'a vermek consumer'i kalici olarak geride birakir. Lag
+# Kafka'nin retention.bytes tavanina (512 MiB x 12 partition) dayandiginda
+# segmentler OKUNMADAN silinir - yani projenin ana iddiasi olan zero-loss tam
+# da canli demoda curur. Sessiz bir bozulma: her sey "ayakta" gorunur.
+#
+# Varsayilan bu yuzden local profilin degeri (docker-compose.yml): laptopta
+# kanitlanmis ve t3.large'in rahatca tasidigi bir hiz. 50k demosu icin
+# instance_type = "t3.xlarge" ve prod profilindeki CPU limitleri BIRLIKTE
+# yukseltilmelidir - tek basina bu degiskeni buyutmek yetmez.
+
+variable "target_rate_per_sec" {
+  description = "Producer'in hedefledigi ping/saniye. t3.large icin 5000; 50000 icin t3.xlarge gerekir."
+  type        = number
+  default     = 5000
+
+  validation {
+    condition     = var.target_rate_per_sec > 0 && var.target_rate_per_sec <= 100000
+    error_message = "target_rate_per_sec 1 ile 100000 arasinda olmali."
+  }
+}
+
+variable "vehicle_count" {
+  description = "Simule edilen arac sayisi. Hedef hizla orantili tutulmali (local profil: 5000 ping/sn -> 2000 arac)."
+  type        = number
+  default     = 2000
+
+  validation {
+    condition     = var.vehicle_count > 0
+    error_message = "vehicle_count pozitif olmali."
+  }
+}
+
 # --- Ag erisimi -------------------------------------------------------------
 
 variable "allowed_ssh_cidr" {

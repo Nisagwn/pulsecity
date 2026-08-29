@@ -106,10 +106,17 @@ write_files:
       # domain verildiyse dis adres HTTPS: Grafana'nin root_url'i de https
       # olmali, aksi halde Grafana kendi uygulama ici baglantilarini http
       # olarak uretir ve tarayici karma icerik uyarisi verir.
+      #
+      # GRAFANA_COOKIE_SECURE de ayni kosula bagli: "secure" cerez yalnizca
+      # HTTPS uzerinden gonderilir. TLS'siz (IP ile servis edilen) bir
+      # kurulumda true yapmak, tarayicinin oturum cerezini hic gondermemesi
+      # yani girisin sessizce calismamasi demektir.
       if [ -n "${domain}" ]; then
         EXTERNAL_URL="https://${domain}"
+        COOKIE_SECURE="true"
       else
         EXTERNAL_URL="http://$PUBLIC_IP"
+        COOKIE_SECURE="false"
       fi
 
       umask 077
@@ -117,8 +124,11 @@ write_files:
       GRAFANA_ADMIN_USER=admin
       GRAFANA_ADMIN_PASSWORD=$GRAFANA_PASSWORD
       GRAFANA_ROOT_URL=$EXTERNAL_URL/grafana/
+      GRAFANA_COOKIE_SECURE=$COOKIE_SECURE
       PULSECITY_DOMAIN=${domain}
       ACME_EMAIL=${acme_email}
+      TARGET_RATE_PER_SEC=${target_rate_per_sec}
+      VEHICLE_COUNT=${vehicle_count}
       ENVFILE
 
       docker compose \

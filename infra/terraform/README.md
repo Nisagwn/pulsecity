@@ -90,6 +90,14 @@ ortamında yeniden değerlendirilmelidir.
 çalışırken ücretsiz, CloudWatch flow log ingest'i düşük). `t3.xlarge`
 ≈ 140 USD/ay.
 
+**CPU kredi modu `standard`.** T3 burstable bir ailedir ve AWS varsayılanı
+`unlimited`'dir: krediler bitince instance yavaşlamaz, vCPU-saat başına ek
+ücret işlemeye başlar. Sürekli akan bir boru hattında CPU hep meşgul olduğu
+için bu, yukarıdaki hesabın üst sınırını kaldırırdı. `standard` modda kredi
+bitince instance taban hızına düşer — demo yavaşlar, fatura öngörülebilir
+kalır. Aynı gerekçeyle `target_rate_per_sec` varsayılanı 5.000'dir (50.000
+değil): bkz. `variables.tf` "Yuk profili".
+
 **Demo bittiğinde `terraform destroy` çalıştır.** Elastic IP, instance
 *kapalıyken* ücret işletir — instance'ı durdurup bırakmak yerine tamamen
 yıkmak daha ucuzdur.
