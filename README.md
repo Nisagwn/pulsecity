@@ -11,6 +11,65 @@ ScyllaDB yazma p99 **48,4 ms**
 
 ## Mimari
 
+```mermaid
+flowchart TB
+
+    subgraph P1["Yol 1 · VERİ — garanti: hiçbir mesaj sessizce kaybolmaz"]
+        direction LR
+        PR["<b>producer</b><br/>Go · 2000 sanal araç<br/>acks = All"]
+        KF["<b>Kafka</b><br/>12 partition · KRaft<br/>key = zone_id"]
+        CO["<b>consumer</b><br/>zone bazlı UnloggedBatch<br/>EMA anomali · manuel commit"]
+        SC["<b>ScyllaDB</b><br/>PK zone_id, ping_time, vehicle_id<br/>TTL 1 saat · TWCS"]
+        DLQ["<b>DLQ</b><br/>vehicle-pings-dlq<br/>7 gün retention"]
+        PR --> KF --> CO --> SC
+        CO -. "parse / yazma hatası" .-> DLQ
+    end
+
+    subgraph P2["Yol 2 · SUNUM — garanti: best-effort; düşmesi veri yolunu etkilemez"]
+        direction LR
+        KF2["Kafka<br/>group: pulsecity-webviz<br/><i>ana consumer'dan bağımsız</i>"]
+        WV["<b>webviz</b><br/>Go · :8080<br/>bellekte son konum tablosu"]
+        MAP["<b>Canlı harita</b><br/>WebSocket + Leaflet<br/>1 snapshot / sn"]
+        HIST["<b>Geçmiş API</b><br/>/api/history<br/>ScyllaDB'den son 30 dk"]
+        KF2 --> WV --> MAP
+        WV --> HIST
+    end
+
+    subgraph P3["Yol 3 · GÖZLEMLENEBİLİRLİK — garanti: yalnızca okur, kritik yola dokunmaz"]
+        direction LR
+        PM["<b>Prometheus</b><br/>metrik toplama<br/>alerts.yml"]
+        AM["<b>Alertmanager</b><br/>gruplama · susturma<br/>Slack (prod)"]
+        LK["<b>Loki</b><br/>Promtail ile<br/>JSON log toplama"]
+        GR["<b>Grafana</b><br/>dashboard + log paneli"]
+        PM --> AM
+        PM --> GR
+        LK --> GR
+    end
+
+    subgraph P4["Production kenarı (Faz 16, 18)"]
+        direction LR
+        CD["<b>Caddy</b> · otomatik TLS + HTTP/3 · lb_policy first<br/>/ → webviz · /grafana/ → Grafana"]
+        BL["<b>webviz (blue)</b><br/>canlı kopya"]
+        GN["<b>webviz-green</b><br/>yalnız deploy sırasında"]
+        CD --> BL
+        CD --> GN
+    end
+
+    classDef veri fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef dlq fill:#ffebee,stroke:#c62828,color:#b71c1c
+    classDef sunum fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef soluk fill:#f4f6f8,stroke:#90a4ae,color:#546e7a
+    classDef gozlem fill:#ede7f6,stroke:#5e35b1,color:#311b92
+    classDef prod fill:#f5f2e8,stroke:#8d7b4f,color:#4e3f1f
+
+    class PR,KF,CO,SC veri
+    class DLQ dlq
+    class WV,MAP,HIST sunum
+    class KF2 soluk
+    class PM,AM,LK,GR gozlem
+    class CD,BL,GN prod
+```
+
 Sistem **üç ayrı yoldan** oluşur ve her yol farklı bir garanti taşır. Bu ayrım
 mimarinin en önemli kararı: sunum ve gözlemlenebilirlik katmanlarının hiçbiri
 zero-loss veri yolunun üzerine oturmaz, dolayısıyla biri düşünce diğeri durmaz.
