@@ -208,6 +208,27 @@ services:
       HISTORY_WINDOW_MS: "2000"
       HISTORY_MAX_AGE_SECONDS: "1800"
       HISTORY_ROWS_PER_ZONE: "2000"
+      # --- Koruma katmani (webviz/limits.go) ---
+      #
+      # Varsayilanlar kodun icinde de ayni; burada gorunur olmalari icin
+      # yaziliyorlar - halka acik bir kurulumda ilk ayarlanacak yer burasi.
+      #
+      #   API_RATE_PER_SEC / API_BURST  IP basina /api/* hiz siniri. Haritanin
+      #                                 kendi kullanimi en fazla 5 istek/sn
+      #                                 uretir (kaydirici 200ms'ye kisitli),
+      #                                 yani mesru kullaniciya iki kat pay var.
+      #   HISTORY_MAX_IN_FLIGHT         Es zamanli gecmis sorgusu tavani. Her
+      #                                 sorgu 9 bolgeye indigi icin 8 -> en
+      #                                 fazla 72 acik ScyllaDB sorgusu.
+      #   MAX_WS_CLIENTS                Es zamanli WebSocket istemcisi tavani.
+      #   ALLOWED_ORIGINS               Bos = yalnizca ayni kaynak. Haritayi
+      #                                 baska bir alan adindan gomeceksen o
+      #                                 host'u virgulle ekle.
+      MAX_WS_CLIENTS: "200"
+      API_RATE_PER_SEC: "10"
+      API_BURST: "30"
+      HISTORY_MAX_IN_FLIGHT: "8"
+      ALLOWED_ORIGINS: ""
     stop_grace_period: 15s
     healthcheck:
       # Scylla'ya BAKMAZ: gecmis okuma kritik yol degil, Scylla dusse bile
@@ -291,6 +312,14 @@ services:
       HISTORY_WINDOW_MS: "2000"
       HISTORY_MAX_AGE_SECONDS: "1800"
       HISTORY_ROWS_PER_ZONE: "2000"
+      # Koruma katmani mavi kopyayla AYNI olmali: gecis aninda trafigi tasiyan
+      # yesil kopyadir, farkli limitlerle calismasi deploy sirasinda davranis
+      # degistirir. Gerekceler icin yukaridaki webviz blogu.
+      MAX_WS_CLIENTS: "200"
+      API_RATE_PER_SEC: "10"
+      API_BURST: "30"
+      HISTORY_MAX_IN_FLIGHT: "8"
+      ALLOWED_ORIGINS: ""
     stop_grace_period: 15s
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]

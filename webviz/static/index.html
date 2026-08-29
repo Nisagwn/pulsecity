@@ -107,7 +107,7 @@
 
 <div id="timebar" class="panel" hidden>
   <button id="live-btn" class="tb-btn active" title="Canlı yayına dön">CANLI</button>
-  <button id="play-btn" class="tb-btn" title="Geçmişi oynat">▶</button>
+  <button id="play-btn" class="tb-btn" title="Oynat — canlıya yetişene kadar geri sayar">▶</button>
   <input id="time-slider" type="range" min="-1800" max="0" value="0" step="1"
          aria-label="Zaman kaydırıcısı">
   <span id="time-label">canlı</span>
@@ -354,14 +354,19 @@ function connect() {
 // --- Zaman yolculuğu --------------------------------------------------------
 // Kaydırıcı geriye çekildiğinde kareler Kafka'dan değil ScyllaDB'den okunur.
 //
-// "offset" sabit bir GECİKME'dir (canlıdan kaç saniye geride). Sabit kaldığı
-// için istenen an (now + offset) gerçek zamanla birlikte ilerler; oynatma bu
-// yüzden kendiliğinden 1x hızda olur, ayrıca bir sayaç gerekmez.
+// "offset" canlıdan kaç saniye geride olduğumuz (negatif). İstenen an
+// `now + offset` olarak hesaplanır. Duraklatılmışken offset sabittir, yani
+// zaman gerçek hızda akar. ▶ ile oynatıldığında offset her saniye 0'a doğru
+// yaklaşır: sayaç −7, −6, −5 diye geri sayar ve 0'a ulaştığında yayın
+// kendiliğinden canlıya döner (YouTube'un canlı yayına yetişmesi gibi).
 
 let offset = 0;           // saniye, 0 = canlı
 let playing = false;
 let historyTimer = null;
-let historyWindow = 2;    // sunucudaki okuma penceresi (saniye)
+
+// Oynatma kaç saniyede canlıya ulaşsın. Adım bu hedefe göre hesaplandığı için
+// 20 saniye geriden de 30 dakika geriden de yetişme süresi aynı kalır.
+const CATCH_UP_SECONDS = 15;
 
 const timebar   = document.getElementById('timebar');
 const slider    = document.getElementById('time-slider');
@@ -379,16 +384,75 @@ function agoText(off) {
   return s < 60 ? `−${s} sn` : `−${Math.round(s / 60)} dk`;
 }
 
+// --- Geçmiş isteklerinin frenlenmesi ---
+//
+// Kaydırıcının `input` olayı sürükleme boyunca saniyede onlarca kez tetiklenir
+// ve her tetikleme doğrudan `fetchHistory`'ye gidiyordu. Sunucu tarafında her
+// istek 9 bölge için ayrı bir ScyllaDB sorgusu açtığından, kaydırıcıyı bir
+// ucundan öbürüne çekmek tek başına yüzlerce sorgu üretiyordu — hem gereksiz
+// (aradaki karelerin hiçbiri ekranda kalmıyor) hem de kalabalık bir demoda
+// ScyllaDB'yi doyurup ana boru hattını yavaşlatacak kadar ağır.
+//
+// İki katmanlı fren:
+//
+//  1. Kısıtlama (throttle): en fazla MIN_FETCH_INTERVAL_MS'de bir istek.
+//     Sürüklerken ara kareler atlanır ama SON konum her zaman istenir —
+//     bekleyen çağrı iptal edilip yenisi kurulduğu için kullanıcı nerede
+//     bıraktıysa oraya ait kare gelir.
+//
+//  2. İptal (AbortController): yeni istek çıkarken uçuşta olan eski istek
+//     iptal edilir. Etmezsek geç dönen eski bir yanıt yeni kareyi EZEBİLİR;
+//     haritanın "geri zıplaması" olarak görünen, kaynağı zor bulunan bir hata.
+const MIN_FETCH_INTERVAL_MS = 200;
+
+let lastFetchAt = 0;
+let pendingFetch = null;
+let inflightFetch = null;
+
+function requestHistory() {
+  const wait = Math.max(0, MIN_FETCH_INTERVAL_MS - (Date.now() - lastFetchAt));
+  clearTimeout(pendingFetch);
+  pendingFetch = setTimeout(fetchHistory, wait);
+}
+
+// cancelHistory, bekleyen ve uçuştaki geçmiş isteklerini iptal eder.
+// CANLI'ya dönerken şart: yoldaki bir geçmiş yanıtı, dönüşten sonra gelip
+// canlı kareyi ezerdi.
+function cancelHistory() {
+  clearTimeout(pendingFetch);
+  pendingFetch = null;
+  if (inflightFetch) {
+    inflightFetch.abort();
+    inflightFetch = null;
+  }
+}
+
 async function fetchHistory() {
+  lastFetchAt = Date.now();
+  if (inflightFetch) inflightFetch.abort();
+  const ctl = new AbortController();
+  inflightFetch = ctl;
+
   const at = Math.floor(Date.now() / 1000) + offset;
   try {
-    const res = await fetch(`/api/history?at=${at}`);
+    const res = await fetch(`/api/history?at=${at}`, { signal: ctl.signal });
+    // 429/503: sunucunun koruma katmanı bizi frenliyor. Hemen yeniden denemek
+    // sıkışıklığı büyütür — kullanıcıya durumu söyleyip bir sonraki kullanıcı
+    // hareketini bekliyoruz.
+    if (res.status === 429 || res.status === 503) {
+      setStatus(false, 'sunucu meşgul, biraz sonra tekrar deneyin');
+      return;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     renderSnapshot(await res.json());
     setStatus(false, `geçmiş · ${clockAt(offset)}`);
   } catch (err) {
+    // Yerine yenisi geçtiği için iptal edilmiş bir istek hata değildir.
+    if (err.name === 'AbortError') return;
     // Geçmiş okunamazsa canlı harita etkilenmez; kullanıcı CANLI'ya dönebilir.
     setStatus(false, `geçmiş okunamadı (${err.message})`);
+  } finally {
+    if (inflightFetch === ctl) inflightFetch = null;
   }
 }
 
@@ -405,7 +469,17 @@ function startPlay() {
   playing = true;
   playBtn.textContent = '❚❚';
   playBtn.classList.add('active');
-  historyTimer = setInterval(fetchHistory, historyWindow * 1000);
+
+  // Adım oynatma BAŞINDA bir kez hesaplanır, her karede yeniden değil: yüzdeyle
+  // azaltmak 0'a asla tam ulaşmayan bir kuyruk bırakırdı. Sabit adımla geri
+  // sayım hem biter hem de öngörülebilir olur. Küçük gecikmelerde adım 1'e
+  // iner, sayaç tam olarak −7, −6, −5 diye ilerler.
+  const step = Math.max(1, Math.ceil(Math.abs(offset) / CATCH_UP_SECONDS));
+
+  historyTimer = setInterval(() => {
+    // 0'a ulaşınca setOffset canlıya geçirir ve oynatmayı durdurur.
+    setOffset(offset + step);
+  }, 1000);
 }
 
 function setOffset(off) {
@@ -417,13 +491,21 @@ function setOffset(off) {
 
   if (offset === 0) {
     stopPlay();
+    cancelHistory();   // yoldaki geçmiş yanıtı canlı kareyi ezmesin
     setStatus(ws && ws.readyState === WebSocket.OPEN, 'canlı');
     return;   // sonraki kare WebSocket'ten gelir
   }
-  fetchHistory();
+  requestHistory();
 }
 
-slider.addEventListener('input', () => setOffset(Number(slider.value)));
+// Oynatma sırasında kaydırıcı çekilirse adım yeni konuma göre yeniden
+// hesaplanmalı; eski adımla devam etmek yetişme süresini bozardı.
+slider.addEventListener('input', () => {
+  const wasPlaying = playing;
+  stopPlay();
+  setOffset(Number(slider.value));
+  if (wasPlaying && offset !== 0) startPlay();
+});
 liveBtn.addEventListener('click', () => setOffset(0));
 playBtn.addEventListener('click', () => {
   if (playing) stopPlay();
@@ -436,7 +518,6 @@ fetch('/api/history/meta')
   .then(res => res.json())
   .then(meta => {
     if (!meta.enabled) return;
-    historyWindow = meta.window_seconds || historyWindow;
     slider.min = -(meta.max_age_seconds || 1800);
     timebar.hidden = false;
   })

@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -173,6 +174,13 @@ type hub struct {
 
 	clientsMu sync.RWMutex
 	clients   map[*client]struct{}
+
+	// maxClients, es zamanli WebSocket istemcisi tavani. 0 = sinirsiz.
+	//
+	// newHub'da DEGIL burada ayarlaniyor (main icinde atanir) cunku newHub'in
+	// imzasi testlerde yedi ayri yerde cagriliyor; sinirin varsayilani 0
+	// oldugu icin mevcut testler davranis degisikligi gormez.
+	maxClients int
 }
 
 func newHub(maxVehicles int) *hub {
@@ -324,17 +332,70 @@ type client struct {
 	send chan []byte
 }
 
+// extraAllowedOrigins, ALLOWED_ORIGINS ile verilen ek host listesi.
+// Bos ise yalnizca ayni kaynak kabul edilir (bkz. originAllowed).
+var extraAllowedOrigins []string
+
 var upgrader = websocket.Upgrader{
-	// Harita herkese acik salt-okunur bir gosterge; origin kisitlamasi yok.
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: originAllowed,
 }
 
-func (h *hub) addClient(c *client) {
+// originAllowed, WebSocket el sikismasinda Origin kontrolu.
+//
+// ONCEDEN `return true` idi ve gerekcesi "harita herkese acik salt-okunur bir
+// gosterge" seklinde yaziliydi. Gerekce eksikti: sorun verinin gizliligi degil,
+// KAYNAK TUKETIMI. `return true` ile herhangi bir web sitesi kendi
+// ziyaretcilerinin tarayicilarindan bize WebSocket actirabilir; her baglanti
+// bizde bir goroutine ve her yayinda bir fan-out maliyeti demek. 512 MB
+// limitli bir konteyner icin bu, baskasinin trafiginin bizim faturamiza
+// yazilmasidir.
+//
+// Politika: AYNI KAYNAK her zaman serbest (haritanin kendi sayfasi), ek olarak
+// ALLOWED_ORIGINS'te listelenen host'lar. Boylece alan adi olan da olmayan da
+// (IP ile servis edilen kurulum) yapilandirma gerektirmeden calisir - Origin
+// zaten sayfanin servis edildigi adrestir.
+func originAllowed(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Tarayici disi istemci (curl, testler, saglik kontrolu) Origin
+		// gondermez. Korumak istedigimiz sey tarayici kaynakli capraz-site
+		// baglantilari; Origin'siz istegi reddetmek araclari ve testleri
+		// kirar, karsiliginda bir sey kazandirmaz.
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	// Yalnizca host karsilastiriliyor, sema degil: TLS'li kurulumda sayfa
+	// https, TLS'siz kurulumda http olarak servis edilir ve ikisi de mesru.
+	if strings.EqualFold(u.Host, r.Host) {
+		return true
+	}
+	for _, allowed := range extraAllowedOrigins {
+		if strings.EqualFold(allowed, u.Host) || strings.EqualFold(allowed, origin) {
+			return true
+		}
+	}
+	return false
+}
+
+// addClient, istemciyi kaydeder. Tavan doluysa false doner.
+//
+// Tavan kontrolu KILIT ALTINDA yapiliyor: serveWS'teki on kontrol ile buranin
+// arasinda baska baglantilar girmis olabilir. Tavani asil koruyan yer burasi,
+// on kontrol yalnizca daha nazik bir hata mesaji icin var.
+func (h *hub) addClient(c *client) bool {
 	h.clientsMu.Lock()
+	if h.maxClients > 0 && len(h.clients) >= h.maxClients {
+		h.clientsMu.Unlock()
+		return false
+	}
 	h.clients[c] = struct{}{}
 	n := len(h.clients)
 	h.clientsMu.Unlock()
 	metricConnectedClients.Set(float64(n))
+	return true
 }
 
 func (h *hub) removeClient(c *client) {
@@ -395,13 +456,39 @@ func (h *hub) broadcast(payload []byte) {
 }
 
 func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
+	// Tavan kontrolu YUKSELTMEDEN ONCE: dolu oldugumuzda tarayiciya duzgun bir
+	// HTTP durumu (503 + Retry-After) donebiliyoruz. Yukselttikten sonra
+	// reddetmek istemciye "baglandim, hemen koptu" gibi gorunur ve
+	// static/index.html'deki otomatik yeniden baglanma dongusunu tetikler -
+	// yani tam da sikisikken istek sayisini artirir.
+	if h.maxClients > 0 && h.clientCount() >= h.maxClients {
+		metricRejectedClients.Inc()
+		w.Header().Set("Retry-After", "10")
+		http.Error(w, "harita su an dolu, biraz sonra tekrar deneyin", http.StatusServiceUnavailable)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		slog.Warn("websocket upgrade hatasi", "remote_addr", r.RemoteAddr, "err", err)
+		// Origin reddi de buraya duser; gorulebilir olmasi icin loglaniyor.
+		slog.Warn("websocket upgrade hatasi",
+			"remote_addr", clientIP(r), "origin", r.Header.Get("Origin"), "err", err)
 		return
 	}
 	c := &client{conn: conn, send: make(chan []byte, 8)}
-	h.addClient(c)
+	if !h.addClient(c) {
+		// On kontrol ile burasi arasinda tavan dolmus. Kapanis nedenini
+		// bildirerek kapatiyoruz ki istemci tarafi bunu bir hata degil, gecici
+		// bir doluluk olarak gorebilsin.
+		metricRejectedClients.Inc()
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "dolu"),
+			time.Now().Add(time.Second),
+		)
+		conn.Close()
+		return
+	}
 
 	// Okuma tarafi: istemciden veri beklemiyoruz ama baglanti kapanisini
 	// yakalamak icin okumak gerekiyor.
@@ -558,6 +645,29 @@ func main() {
 	// okunurdu; ortalama hiz ve merkez bu ornek uzerinden de saglikli cikar.
 	histRowsPerZone, _ := strconv.Atoi(getenv("HISTORY_ROWS_PER_ZONE", "2000"))
 
+	// --- Koruma katmani (bkz. limits.go) ---
+	//
+	// Varsayilanlar HARITANIN KENDI KULLANIM DESENINE gore secildi, tahminle
+	// degil: static/index.html oynatma sirasinda saniyede 1 istek atar ve
+	// kaydirici suruklenirken bunu 200ms'ye (5/sn) kisitlar. 10/sn + 30
+	// patlama, tek bir mesru kullaniciya iki kat pay birakir; bir dongu ile
+	// istek yagdiran istemciyi ise saniyede 10'a sabitler.
+	maxWSClients, _ := strconv.Atoi(getenv("MAX_WS_CLIENTS", "200"))
+	apiRatePerSec, _ := strconv.Atoi(getenv("API_RATE_PER_SEC", "10"))
+	apiBurst, _ := strconv.Atoi(getenv("API_BURST", "30"))
+	apiMaxIPs, _ := strconv.Atoi(getenv("API_MAX_TRACKED_IPS", "4096"))
+	// 8 es zamanli gecmis sorgusu = 8 x 9 bolge = en fazla 72 acik ScyllaDB
+	// sorgusu. Bu tavan, harita gecmisinin ana boru hattinin yazma yolunu
+	// yavaslatmasini engellemek icin var.
+	histMaxInFlight, _ := strconv.Atoi(getenv("HISTORY_MAX_IN_FLIGHT", "8"))
+	if origins := getenv("ALLOWED_ORIGINS", ""); origins != "" {
+		for _, o := range strings.Split(origins, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				extraAllowedOrigins = append(extraAllowedOrigins, o)
+			}
+		}
+	}
+
 	setupLogger("webviz")
 
 	slog.Info("baslatiliyor",
@@ -566,9 +676,14 @@ func main() {
 		"group_id", groupID,
 		"broadcast_interval_ms", intervalMs,
 		"max_vehicles", maxVehicles,
+		"max_ws_clients", maxWSClients,
+		"api_rate_per_sec", apiRatePerSec,
+		"history_max_in_flight", histMaxInFlight,
+		"allowed_origins", extraAllowedOrigins,
 	)
 
 	h := newHub(maxVehicles)
+	h.maxClients = maxWSClients
 	history := newHistoryStore(
 		time.Duration(histWindowMs)*time.Millisecond,
 		time.Duration(histMaxAgeSec)*time.Second,
@@ -654,9 +769,25 @@ func main() {
 		}
 	}()
 
+	// Koruma katmani yalnizca /api/* uzerinde.
+	//
+	// /metrics, /healthz ve /readyz BILEREK disarida: bunlari Prometheus ve
+	// Docker healthcheck cagirir. Saglik sondasina hiz siniri koymak, sistem
+	// sikisikken sondanin da 429 yemesi ve konteynerin SAGLIKSIZ sayilarak
+	// yeniden baslatilmasi demektir - yani koruma katmani, korumasi gereken
+	// servisi oldururdu. "/" de disarida: gomulu bir HTML dosyasi, ScyllaDB'ye
+	// inmiyor.
+	guard := &apiGuard{
+		limiter:    newIPRateLimiter(apiRatePerSec, apiBurst, apiMaxIPs),
+		inFlight:   newInFlightLimiter(histMaxInFlight),
+		retryAfter: 5,
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/history", history.handleSnapshot)
-	mux.HandleFunc("/api/history/meta", history.handleMeta)
+	mux.HandleFunc("/api/history", guard.limitHeavy(history.handleSnapshot))
+	// meta ScyllaDB'ye inmez (yalnizca yapilandirmayi doner), es zamanlilik
+	// slotu tuketmesi gereksiz olurdu - hiz siniri yeterli.
+	mux.HandleFunc("/api/history/meta", guard.limit(history.handleMeta))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -685,7 +816,44 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	srv := &http.Server{Addr: listenAddr, Handler: mux}
+	// Timeout'lar.
+	//
+	// Onceden HICBIRI yoktu (`&http.Server{Addr, Handler}`). Go'nun varsayilani
+	// SINIRSIZ beklemektir; halka acik bir adreste bu, Slowloris'in tanimidir:
+	// saldirgan yuzlerce baglanti acar ve her birinde istek basligini bayt bayt,
+	// cok yavas gonderir. Hicbiri "hatali" degildir, hicbiri zaman asimina
+	// ugramaz, ama her biri bir goroutine ve bir dosya tanimlayicisi tutar.
+	// 512 MB limitli bir konteyneri devirmek icin trafik degil sabir yeter.
+	//
+	// WEBSOCKET NEDEN KIRILMIYOR: bu deadline'lar hijack edilmis baglantiya da
+	// yansir ve normalde uzun omurlu WebSocket'i keserdi. gorilla/websocket'in
+	// Upgrade'i bunu biliyor ve hijack ettikten hemen sonra deadline'lari
+	// temizliyor (server.go icinde `netConn.SetDeadline(time.Time{})`).
+	// Yazma tarafinda ise her kare icin kendi deadline'imizi zaten koyuyoruz
+	// (serveWS -> SetWriteDeadline). Yani WebSocket yolu bu ayarlardan
+	// etkilenmiyor; korunan sey normal HTTP yolu.
+	srv := &http.Server{
+		Addr:    listenAddr,
+		Handler: mux,
+
+		// Asil Slowloris savunmasi bu: baslik okumasi icin ayri ve kisa bir
+		// sure. Yavas govde gonderen bir istemciyi ReadTimeout keser, ama
+		// baslik asamasinda takilan istemciyi yalnizca bu yakalar.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+
+		// WriteTimeout, handleSnapshot'in kendi 10sn'lik context timeout'undan
+		// belirgin bicimde buyuk: once uygulama kendi hatasini duzgun bir JSON
+		// olarak donsun, baglanti ancak o da olmazsa kesilsin.
+		WriteTimeout: 20 * time.Second,
+
+		// Bosta bekleyen keep-alive baglantilari toplansin.
+		IdleTimeout: 120 * time.Second,
+
+		// Varsayilan 1 MB; bu serviste hicbir mesru istek 64 KB baslik
+		// gerektirmiyor.
+		MaxHeaderBytes: 1 << 16,
+	}
 
 	go func() {
 		slog.Info("harita hazir", "addr", listenAddr, "url", "http://localhost"+listenAddr)
