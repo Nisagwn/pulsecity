@@ -59,6 +59,24 @@ resource "aws_instance" "app" {
     instance_metadata_tags      = "disabled"
   }
 
+  # T3 KREDI MODU: `standard` - AWS varsayilani olan `unlimited` DEGIL.
+  #
+  # T3 burstable bir ailedir: t3.large'in TABAN performansi vCPU basina %30'dur,
+  # ustu CPU kredisiyle karsilanir. Varsayilan `unlimited` modda krediler
+  # bitince instance yavaslamaz - AWS ek ucret islemeye baslar (vCPU-saat
+  # basina). Bu is yuku surekli akan bir boru hattidir, yani CPU'yu surekli
+  # mesgul eder: `unlimited` birakmak fatura ust sinirini KALDIRIR ve
+  # README'deki "~60 USD/ay" hesabini gecersiz kilar.
+  #
+  # `standard`: kredi bitince instance taban hizina duser. Demo yavaslar ama
+  # fatura ongorulebilir kalir. Ogrenme/demo ortaminda dogru takas budur;
+  # performans olcumu yapilacaksa burst'e degil, daha buyuk bir instance'a
+  # (t3.xlarge ya da m-ailesi) gecilmelidir - burst zaten SUREKLI yuk icin
+  # tasarlanmamistir.
+  credit_specification {
+    cpu_credits = "standard"
+  }
+
   root_block_device {
     volume_type = "gp3"
     volume_size = var.root_volume_size_gb
@@ -88,6 +106,11 @@ resource "aws_instance" "app" {
     age_ssm_path     = var.age_private_key == "" ? "" : aws_ssm_parameter.age_private_key[0].name
     domain           = var.domain
     acme_email       = var.acme_email
+
+    # Yuk profili: cloud-init bunlari .env'e yazmazsa prod override 50.000 msg/sn
+    # varsayilanina duser. Gerekce: variables.tf "Yuk profili" bolumu.
+    target_rate_per_sec = var.target_rate_per_sec
+    vehicle_count       = var.vehicle_count
   })
 
   tags = {

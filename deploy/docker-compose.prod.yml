@@ -60,8 +60,20 @@ services:
     restart: unless-stopped
     ports: []   # local'de disariya acilan 2112 portu, prod'da kapali - Prometheus internal network'ten erisir
     environment:
-      TARGET_RATE_PER_SEC: "${TARGET_RATE_PER_SEC:-50000}"
-      VEHICLE_COUNT: "${VEHICLE_COUNT:-20000}"
+      # VARSAYILAN 50.000 DEĞİL, 5.000.
+      #
+      # Önceki değer sessiz bir tuzaktı: 50k rakamı Faz 3'te 12 çekirdek /
+      # 7,6 GB ile ölçülmüştü, ama bu profilin hedefi t3.large (2 vCPU) ve
+      # producer'a burada 0.5 CPU limiti konuyor. `.env` içinde bu satır
+      # doldurulmadığı her kurulumda consumer kalıcı olarak geride kalır;
+      # lag Kafka'nın retention.bytes tavanına dayandığında segmentler
+      # OKUNMADAN silinir — yani projenin ana iddiası olan zero-loss tam da
+      # canlıda çürür. Hiçbir hata da görünmez: her şey "ayakta" kalır.
+      #
+      # Artık güvenli değer varsayılan, tehlikeli olan açık bir tercih.
+      # 50k için 4 vCPU / 16 GB'a çıkıp buradaki CPU limitlerini de büyüt.
+      TARGET_RATE_PER_SEC: "${TARGET_RATE_PER_SEC:-5000}"
+      VEHICLE_COUNT: "${VEHICLE_COUNT:-2000}"
       PRODUCER_WORKERS: "${PRODUCER_WORKERS:-4}"
       # Faz 8 demo modu prod'da KAPALI: yapay tikaniklik bolgesel hiz
       # metriklerini ve benchmark sonuclarini kirletir.
@@ -159,6 +171,38 @@ services:
       # Faz 9'dan sonra kök adres haritaya ayrıldı, Grafana alt yola taşındı.
       GF_SERVER_ROOT_URL: "${GRAFANA_ROOT_URL:-http://localhost/grafana/}"
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+
+      # --- Sertleştirme ---
+      #
+      # Anonim GÖRÜNTÜLEME bilerek açık kalıyor: demo linki paylaşılabilsin
+      # diye. Sertleştirilen şey görüntüleme değil, HESAP yüzeyi — yani
+      # birinin admin olarak İÇERİ girme ihtimali.
+      #
+      # Kaba kuvvet koruması Grafana'nın kendi işi (aynı kullanıcı için 5
+      # başarısız denemeden sonra kilit). Burada açıkça "false" yazılması bir
+      # tekrar değil, bir SÖZLEŞME: varsayılana güvenip sessiz kalmak, ileride
+      # bir sürüm varsayılanı değiştirdiğinde kimsenin fark etmeyeceği bir
+      # gerileme bırakırdı.
+      #
+      # Reverse proxy katmanında hız sınırı YOK ve bu bilinçli: stok Caddy
+      # rate_limit modülüyle gelmez, eklemek xcaddy ile özel imaj derlemeyi
+      # gerektirir. Tedarik zinciri (digest sabitleme + Trivy taraması) o
+      # noktada elle bakım gerektiren bir yola girer; kazanç, Grafana'nın kendi
+      # kilit mekanizması zaten devredeyken buna değmiyor.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_ALLOW_ORG_CREATE: "false"
+      GF_SECURITY_DISABLE_BRUTE_FORCE_LOGIN_PROTECTION: "false"
+      # Alan adı verilmişse (yani TLS varsa) oturum çerezi yalnızca HTTPS
+      # üzerinden gitsin. TLS'siz kurulumda "true" yapmak girişi tamamen
+      # kırardı — bu yüzden cloud-init domain'e göre yazıyor.
+      GF_SECURITY_COOKIE_SECURE: "${GRAFANA_COOKIE_SECURE:-false}"
+      GF_SECURITY_COOKIE_SAMESITE: "lax"
+      # Dışarıya giden istekleri kes: gravatar kullanıcı e-postasının hash'ini
+      # üçüncü bir tarafa sızdırır, telemetri ve sürüm kontrolü ise sunucudan
+      # habersiz dış bağlantı açar.
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
     deploy:
       resources:
         limits:
