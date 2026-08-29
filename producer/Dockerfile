@@ -27,7 +27,26 @@ FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec4
 #
 # Sabit UID (10001) bilerek: Kubernetes'te runAsNonRoot admission kontrolu
 # imajin sayisal bir UID bildirmesini ister, isim cozumlemesine guvenmez.
-RUN addgroup -g 10001 -S pulsecity \
+# Base imajdaki paketleri yayindaki yamalarla guncelle.
+#
+# NEDEN GEREKLI: digest sabitlemesi build girdisini dondurur - istedigimiz sey
+# buydu - ama Alpine bir guvenlik yamasini PAKET DEPOSUNA koyduktan sonra resmi
+# imajin yeniden insa edilmesi gunler alabilir. O aralikta sabitlenmis digest
+# yamayi almamis olur.
+#
+# Somut ornek (bu satirin sebebi): CVE-2026-14456, openssl'de HIGH seviyeli bir
+# DoS. Duzeltme Alpine deposunda 3.5.8-r0 olarak hazirdi, ama alpine:3.24
+# imajinin o anki digest'i hala 3.5.7-r0 tasiyordu ve bump edilecek daha yeni
+# bir digest YOKTU. CI'daki Trivy kapisi (ignore-unfixed: true, yani yalnizca
+# duzeltmesi olan aciklarda kirilir) haklı olarak kirmiziya dondu.
+#
+# BEDELI: build ciktisi artik build ZAMANINA da bagli; digest sabitlemesinin
+# verdigi tam tekrarlanabilirlik zayifliyor. Takas bilincli - yama almamis bir
+# imaj yayinlamaktansa ayni Dockerfile'in iki farkli gunde biraz farkli imaj
+# uretmesini kabul ediyoruz. Bit-bit ayni imaj gerektiginde Dockerfile ile
+# degil, yayinlanmis imaj digest'i ile calisilmali.
+RUN apk --no-cache upgrade \
+ && addgroup -g 10001 -S pulsecity \
  && adduser  -u 10001 -S pulsecity -G pulsecity
 
 # Binary root'a ait ve salt-okunur: uygulama kendi calistirdigi dosyayi

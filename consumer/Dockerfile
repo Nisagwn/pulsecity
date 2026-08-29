@@ -15,7 +15,10 @@ FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec4
 
 # Ayricaliksiz kullanici, sabit UID (Kubernetes runAsNonRoot icin sayisal deger
 # gerekir). Bkz. producer/Dockerfile.
-RUN addgroup -g 10001 -S pulsecity \
+# apk upgrade: digest sabitlemesi ile guvenlik yamasi arasindaki aralik icin.
+# Tam gerekce: bkz. producer/Dockerfile.
+RUN apk --no-cache upgrade \
+ && addgroup -g 10001 -S pulsecity \
  && adduser  -u 10001 -S pulsecity -G pulsecity
 
 COPY --from=build --chown=root:root --chmod=0755 /consumer /consumer
