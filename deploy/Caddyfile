@@ -41,8 +41,27 @@
 	# Connection başlıklarını ve HTTP/1.1 yükseltmesini kendiliğinden yönetir.
 	# Nginx'te bu, unutulduğunda haritanın sürekli yeniden bağlanmasına yol
 	# açan ayrı bir `location /ws` bloğu gerektiriyordu.
+	# --- Faz 4: Grafana (alt yol) ---
+	#
+	# ÖNEK KESİLMİYOR — bu bilinçli ve zorunlu.
+	#
+	# Grafana `GF_SERVER_SERVE_FROM_SUB_PATH=true` ile çalışıyor, yani
+	# `/grafana/...` yolunu KENDİSİ karşılıyor. Buraya bir
+	# `uri strip_prefix /grafana` koymak sonsuz yönlendirme döngüsü üretir:
+	#
+	#   istek /grafana/  ->  Caddy öneki keser  ->  Grafana `/` görür
+	#   Grafana "burası /grafana/ olmalı" der ve 301 döner
+	#   tarayıcı /grafana/ ister  ->  Caddy yine keser  ->  başa dön
+	#
+	# Dışarıdan görünüşü tam olarak buydu: `/grafana/` kendisine 301 veriyordu
+	# ve sayfa hiç açılmıyordu. Gerçek sunucuda yakalandı; kesme davranışı
+	# Nginx sürümünden (`proxy_pass http://grafana:3000/;` — sondaki eğik çizgi
+	# de öneki keser) beri taşınıyordu.
+	#
+	# İki tutarlı yapılandırma var, karışımı bozuk:
+	#   proxy öneki KESİYOR   -> GF_SERVER_SERVE_FROM_SUB_PATH=false
+	#   proxy öneki KORUYOR   -> GF_SERVER_SERVE_FROM_SUB_PATH=true   <- bizimki
 	handle /grafana/* {
-		uri strip_prefix /grafana
 		reverse_proxy grafana:3000
 	}
 
