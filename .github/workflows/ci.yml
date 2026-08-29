@@ -380,7 +380,7 @@ jobs:
 
       - name: İmaj etiketlerini hazırla
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ steps.owner.outputs.lc }}/pulsecity-${{ matrix.module }}
           tags: |
