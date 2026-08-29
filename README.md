@@ -1,27 +1,146 @@
 # PulseCity
 
-Go, Kafka ve ScyllaDB ile şehir içi trafik yoğunluğunu saniyede 50.000 GPS
-ping'i hızında, sıfır kayıpla işleyen ve Grafana'da canlı analiz eden bir
-veri boru hattı.
+Go, Kafka ve ScyllaDB ile şehir içi trafik yoğunluğunu **saniyede 50.000 GPS
+ping'i** hızında, sıfır kayıpla işleyen gerçek zamanlı veri boru hattı —
+Uber/Yandex'in çözdüğü probleme benzer bir mimari. Canlı Leaflet haritası,
+bölgesel anomali tespiti, alarm zinciri ve TLS'li blue-green production
+kurulumu dahil.
 
-Sanal araçlardan gelen konum verisini simüle eden bir load generator, Kafka
-üzerinden akan bu veriyi paralel Go consumer'lar ScyllaDB'ye batch halinde
-yazar; Prometheus + Grafana ile bölge bazlı trafik yoğunluğu gerçek zamanlı
-izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
+Ölçülen (Faz 3): **50.477 msg/sn** işlenen · **0** kayıp · **0** DLQ ·
+ScyllaDB yazma p99 **48,4 ms**
 
 ## Mimari
 
+Sistem **üç ayrı yoldan** oluşur ve her yol farklı bir garanti taşır. Bu ayrım
+mimarinin en önemli kararı: sunum ve gözlemlenebilirlik katmanlarının hiçbiri
+zero-loss veri yolunun üzerine oturmaz, dolayısıyla biri düşünce diğeri durmaz.
+
+| Yol | Bileşenler | Garanti |
+|---|---|---|
+| **Veri yolu** | producer → Kafka → consumer → ScyllaDB | Zero-loss: hiçbir mesaj sessizce kaybolmaz (Faz 2) |
+| **Sunum yolu** | Kafka → webviz → WebSocket/Leaflet, geçmiş için ScyllaDB | Best-effort: ayrı consumer group, throttle'lı; düşmesi veri yolunu etkilemez (Faz 9, 11) |
+| **Gözlemlenebilirlik yolu** | Prometheus/Alertmanager (metrik) + Promtail/Loki (log) → Grafana | Yan etkisiz: yalnızca okur, kritik yola hiç dokunmaz (Faz 4, 13, 17) |
+
+### Veri ve sunum yolu
+
 ```
-[Go Load Generator] --> [Kafka: vehicle-pings (12 partition)] --> [Go Consumer Group]
-                         [Kafka: vehicle-pings-dlq]  <--(hata)--'         |
-                                                                          v
-                                                                   [ScyllaDB]
-                                                                  (zone_id partition key)
-                                                                          |
-                                                     [Prometheus] <-------'
-                                                          |
-                                                     [Grafana Dashboard]
+   ┌──────────────────┐                    ┌───────────────────────────────────────────┐
+   │     producer     │   acks = All       │         Kafka  (KRaft, tek broker)        │
+   │    Go · :2112    │   retry + backoff  │  vehicle-pings      12 partition · 1 saat │
+   │  2000 sanal araç │ ──────────────────>│  vehicle-pings-dlq   3 partition · 7 gün  │
+   │   key = zone_id  │                    └──┬─────────────────────────────────────┬──┘
+   └──────────────────┘                       │                                     │
+                         group: pulsecity-consumers              group: pulsecity-webviz
+                                              v                                     v
+          ┌────────────────────────────────────────────┐   ┌───────────────────────────────┐
+          │                  consumer                  │   │            webviz             │
+          │        Go · :2113 · yatay ölçeklenir       │   │          Go · :8080           │
+          │  zone bazlı UnloggedBatch (2000 satır)     │   │  bellekte "son konum" tablosu │
+          │  ÖNCE ScyllaDB'ye yaz, SONRA offset commit │   │  1 sn'de bir WS snapshot      │
+          │  EMA baseline + bölge anomali tespiti      │   │  Leaflet arayüz (go:embed)    │
+          │  parse/yazma hatası ──> DLQ topic'ine      │   │  geçmiş: /api/history         │
+          └─────────────────────┬──────────────────────┘   └───────────────┬───────────────┘
+                                │                                          │
+                                v                                          │ son 30 dk · 9 bölge
+                     ┌──────────────────────────────────────┐              │
+                     │               ScyllaDB               │<─────────────┘
+                     │  PK (zone_id, ping_time, vehicle_id) │
+                     │  TTL 1 saat · TWCS 10 dakika pencere │
+                     └──────────────────────────────────────┘
 ```
+
+### Gözlemlenebilirlik yolu
+
+```
+   producer  :2112 ─┐
+   consumer  :2113 ─┤                                  ┌──> Alertmanager :9093 ──> Slack*
+   webviz    :8080 ─┼──> Prometheus :9090 ─ alerts.yml ┘     (gruplama · susturma)
+   kafka-exporter  ─┘         │      ^
+   :9308 (lag)                │      └── webviz anomali rozetini buradan okur (PROM_URL)
+                              v
+                         Grafana :3000 <── Loki :3100 <── Promtail <── docker.sock (JSON log)
+```
+
+\* Slack bildirimi yalnızca **prod** profilinde bağlıdır
+(`monitoring/alertmanager.prod.yml`, webhook `slack_api_url_file` ile SOPS'tan
+çözülen dosyadan okunur). Local `alertmanager.yml`'de bildirim kanalı bilerek
+boştur — alarmların üretildiği ve doğru gruplandığı http://localhost:9093
+arayüzünden doğrulanır.
+
+Alarm kuralları (`monitoring/alerts.yml`) iki sınıfa ayrılır. **critical**:
+batch commit edilemiyor, ScyllaDB bağlantısı yok, servis kapalı, producer yazma
+hatası, boru hattı durdu. **warning**: DLQ doluyor, consumer lag > 200k,
+ScyllaDB yazma gecikmesi yüksek. Faz 18'in otomatik rollback'i tam olarak bu
+`critical` sınıfını okur — "kötü gidiyor"un makine tarafından okunabilir tanımı budur.
+
+### Production kenarı (Faz 16, 18)
+
+Local'de her servis kendi portunu dışa açar. Production override'ında
+(`deploy/docker-compose.prod.yml`) tek dış kapı Caddy'dir; Prometheus,
+Alertmanager, Loki ve producer metrik portları `ports: []` ile kapatılır,
+arayüzlerine SSH tüneliyle bakılır.
+
+```
+   internet ──80/443──> Caddy (otomatik TLS · Let's Encrypt · HTTP/3)
+                          ├── /         ──> webviz (blue) ─┐ lb_policy first
+                          │                 webviz-green  ─┘ = sıradaki İLK SAĞLIKLI upstream
+                          └── /grafana/ ──> Grafana
+```
+
+Blue-green geçişi bir **konteyner işlemi**: yeşili ayağa kaldır, `/readyz` ile
+hazır olduğunu doğrula, maviyi durdur. Caddy yapılandırması hiç değişmez, reload
+yoktur. `webviz-green` normalde `bluegreen` compose profili arkasında durur ve
+yalnızca `./scripts/deploy-webviz.sh` çalışırken ayağa kalkar.
+
+### Servis envanteri
+
+| Servis | Rol | Local port | Prod'da dışa açık |
+|---|---|---|---|
+| `producer` | Go load generator; sanal araç GPS ping'i üretir | 2112 (metrik) | hayır |
+| `consumer` | Kafka → ScyllaDB, DLQ, EMA anomali tespiti | 2113 (metrik) | hayır (prod'da 2 replika) |
+| `webviz` | WebSocket yayını + Leaflet harita + geçmiş API'si | 8080 | Caddy üzerinden `/` |
+| `webviz-green` | Blue-green'in yeşil kopyası (`bluegreen` profili) | — | yalnızca geçiş anında `/` |
+| `kafka` | Tek broker, KRaft (Zookeeper yok) | 9092 | hayır |
+| `scylla` | Zaman serisi deposu | 9042 | hayır |
+| `kafka-exporter` | Consumer lag metriği (uygulama kodundan expose edilemez) | 9308 (iç ağ) | hayır |
+| `prometheus` | Metrik toplama + alarm hesaplama | 9090 | hayır (SSH tüneli) |
+| `alertmanager` | Gruplama, susturma, bildirim (Slack yalnız prod) | 9093 | hayır (SSH tüneli) |
+| `loki` / `promtail` | Log deposu / Docker API'den log keşfi | 3100 | hayır (Grafana üzerinden) |
+| `grafana` | Dashboard + log paneli | 3000 | Caddy üzerinden `/grafana/` |
+| `caddy` | Reverse proxy, otomatik TLS, blue-green yönlendirme | — (yalnız prod) | 80 / 443 |
+
+Üç Go servisinin üçü de aynı sözleşmeyi taşır: `/metrics` (Prometheus),
+`/healthz` (process ayakta mı) ve `/readyz` (bağımlılığı gerçekten çalışıyor mu).
+Ayrım kasıtlı — `/readyz` producer'da Kafka'ya son başarılı yazmanın üstünden
+geçen süreye, consumer'da canlı bir ScyllaDB sorgusuna bakar; salt process
+kontrolü "ayakta ama hiçbir şey yazamıyor" durumunu göremezdi.
+
+### Kafka konuları ve consumer group'ları
+
+| Konu | Partition | Retention | Not |
+|---|---|---|---|
+| `vehicle-pings` | 12 | 1 saat / partition başına 512 MiB | `segment.bytes` 128 MiB'a çekildi; Kafka yalnızca KAPANMIŞ segmenti silebilir, 1 GiB'lik varsayılanla 512 MiB'lik tavan hiç devreye giremezdi |
+| `vehicle-pings-dlq` | 3 | 7 gün | Uzun olması bilerek: oradaki mesajlar incelenmek için var, hacmi de düşük |
+
+| Consumer group | Kim | Neden ayrı |
+|---|---|---|
+| `pulsecity-consumers` | consumer replikaları | Zero-loss kritik yolu; manuel offset commit |
+| `pulsecity-webviz` | canlı harita | Ana consumer'ın offset'ine dokunmaz, ondan mesaj çalmaz |
+| `pulsecity-webviz-green` | blue-green yeşil kopya | Aynı group'u paylaşsalardı Kafka partition'ları ikiye böler, iki harita da akışın yalnızca yarısını görürdü |
+
+### Veri modeli
+
+```sql
+PRIMARY KEY (zone_id, ping_time, vehicle_id)   -- CLUSTERING ORDER BY (ping_time DESC)
+default_time_to_live = 3600                    -- haritanın geriye bakma penceresinin 2 katı
+gc_grace_seconds     = 3600                    -- RF=1'de repair penceresine gerek yok
+compaction           = TimeWindowCompactionStrategy (10 dakika)
+```
+
+TTL ile TWCS birlikte seçildi: TWCS her zaman penceresini ayrı bir SSTable'da
+tutar, böylece süresi tamamen dolmuş bir pencere pahalı bir compaction
+beklemeden, dosya silinerek geri kazanılır. Varsayılan SizeTiered'da süresi
+dolmuş satırlar taze verinin içine karışırdı.
 
 **Neden bu tasarım kararları:**
 
@@ -33,23 +152,36 @@ izlenir. Uber/Yandex gibi şirketlerin çözdüğü probleme benzer bir mimari.
 | Manuel Kafka offset commit | Auto-commit ile "işlemeden önce commit" riski var — zero-loss için önce ScyllaDB'ye yaz, sonra commit et |
 | UnloggedBatch (zone bazlı), LoggedBatch değil | ScyllaDB'de çoklu-partition LoggedBatch pahalı bir batchlog mekanizması kullanır; aynı partition içi UnloggedBatch + paralel goroutine çok daha performanslı |
 | DLQ (dead-letter queue) | Hiçbir mesaj sessizce kaybolmasın — parse/yazma hatası olan her mesaj DLQ'ya yönlendirilir |
+| Anomali tespiti consumer'da, webviz'de değil | `zone_id` hem Kafka hem ScyllaDB partition key'i olduğu için bir bölgenin tüm mesajları tek bir consumer replikasına düşer; `--scale consumer=3` yapıldığında EMA baseline'ı bölünmez. webviz sonucu Prometheus'tan okur, yeniden hesaplamaz |
+| Harita için ayrı servis + ayrı consumer group | Sunum katmanını zero-loss yoluna eklemek onu dayanıklılık garantisine bağlardı; ayrıca `--scale consumer=3` durumunda her replika akışın yalnızca bir kısmını görür, harita eksik olurdu |
+| WebSocket'te saniyede bir snapshot | 5000+ msg/sn tarayıcıya iletilemez; bellekte "her aracın son konumu" tutulup saniyede bir yayınlanınca ağ yükü mesaj hızından bağımsız hale gelir (37 KB/snapshot, 1500 araç) |
+| Consumer lag için ayrı exporter | Lag Kafka'nın kendi metriği, uygulama kodundan expose edilemez; exporter olmadan üzerine alarm kurulamıyordu |
+| Nginx yerine Caddy | Sertifikayı kendisi alır, kendisi yeniler ve HTTP'yi HTTPS'e kendisi yönlendirir. Nginx'te aynı şey certbot + timer + reload kancası + TLS blokları demekti — dört ayrı, sessizce bozulabilen parça |
+| Blue-green yalnızca webviz'e | Consumer zaten Kafka rebalance'ı ile yatay; Kafka/ScyllaDB gibi stateful bileşenler blue-green'e hiç girmez (iki kopya aynı veriyi paylaşamaz). Kesintisiz deploy'a gerçekten ihtiyacı olan tek katman kullanıcıya bakan taraf |
 
 ## Klasör yapısı
 
 ```
 .
-├── docker-compose.yml       # Kafka, ScyllaDB, producer, consumer, webviz, Prometheus, Grafana
-├── producer/                # Go load generator (sanal araç GPS ping üreteci)
-├── consumer/                # Go consumer (Kafka -> ScyllaDB, DLQ, anomali tespiti)
-├── webviz/                  # Go WebSocket servisi + Leaflet canlı harita (Faz 9)
-│                            # + ScyllaDB'den geçmişe bakma (Faz 11)
-├── scylla-init/schema.cql   # ScyllaDB şema tanımı
-├── monitoring/              # Prometheus + alarm kuralları, Alertmanager, Loki/Promtail,
-│                            # Grafana provisioning/dashboard
-├── scripts/                 # zero-loss testi, benchmark, chaos testing scriptleri
-├── deploy/                  # Production/CI compose override, Caddy (TLS), Nginx, VPS rehberi
-├── infra/terraform/         # Altyapı kod olarak: VPC, EC2, IAM, SSM (Faz 14)
-└── .github/workflows/       # CI/CD (lint, test, uçtan uca test, imaj yayınlama)
+├── docker-compose.yml        # Local yığın: Kafka, ScyllaDB, producer, consumer, webviz,
+│                             # kafka-exporter, Prometheus, Alertmanager, Loki, Promtail, Grafana
+├── .env.example              # Prod ortam değişkenleri şablonu (Grafana, yük profili, alan adı)
+├── producer/                 # Go load generator (sanal araç GPS ping üreteci)
+├── consumer/                 # Go consumer (Kafka -> ScyllaDB, DLQ, EMA anomali tespiti)
+├── webviz/                   # Go WebSocket servisi + Leaflet canlı harita (Faz 9)
+│   ├── history.go            #   ScyllaDB'den geçmişe bakma (Faz 11)
+│   ├── limits.go             #   Koruma katmanı: hız sınırı, WS tavanı, origin (Faz 12)
+│   └── static/index.html     #   Harita arayüzü (binary'ye go:embed ile gömülü)
+├── scylla-init/schema.cql    # ScyllaDB şeması + TTL/TWCS veri yaşam döngüsü
+├── monitoring/               # prometheus.yml, alerts.yml, alertmanager(.prod).yml,
+│                             # loki-config.yml, promtail-config.yml, grafana/provisioning
+├── scripts/                  # verify-zero-loss · benchmark · chaos-test · deploy-webviz · secrets
+├── deploy/                   # prod/CI/bench compose override'ları, Caddyfile (TLS + blue-green),
+│                             # nginx.conf (Faz 16 öncesi kurulum), DEPLOY.md
+├── infra/terraform/          # VPC, EC2, IAM/SSM, security group, VPC flow log, cloud-init (Faz 14)
+├── secrets/                  # SOPS + age ile şifrelenmiş sırlar ve örnek dosyaları (Faz 15)
+├── .sops.yaml                # Hangi dosyanın hangi age anahtarıyla şifreleneceği
+└── .github/workflows/ci.yml  # lint · test · uçtan uca · sır hijyeni · Trivy/SBOM · IaC · imaj · deploy
 ```
 
 ## Hızlı başlangıç (local)
@@ -839,5 +971,16 @@ docker compose logs -f producer consumer
 
 ## Teknoloji yığını
 
-Go · Apache Kafka (KRaft mode) · ScyllaDB · Prometheus · Grafana · WebSocket (gorilla) ·
-Leaflet · Docker Compose · Nginx · GitHub Actions
+**Veri yolu:** Go · Apache Kafka (KRaft mode) · ScyllaDB (TWCS + TTL)
+
+**Sunum:** WebSocket (gorilla) · Leaflet · `go:embed`
+
+**Gözlemlenebilirlik:** Prometheus · Alertmanager · kafka-exporter · Loki + Promtail · Grafana
+
+**Çalıştırma & dağıtım:** Docker Compose · Caddy (otomatik TLS, blue-green) ·
+Terraform + AWS (VPC, EC2, IAM/SSM, flow log) · SOPS + age · GitHub Actions
+(gofmt + `go vet`, `go test -race`, uçtan uca boru hattı testi, sır hijyeni taraması,
+Trivy imaj/Dockerfile/Terraform denetimi + SPDX SBOM, GHCR imaj yayınlama)
+
+*Nginx (`deploy/nginx.conf`) Faz 16'da yerini Caddy'ye bıraktı; TLS istemeyen
+kurulumlar için referans olarak duruyor.*
