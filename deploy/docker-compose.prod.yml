@@ -21,22 +21,34 @@
 # sessiz bir bozulma: local'de kimse prod profilini çalıştırmadığı için
 # görünmüyordu.
 #
-#   kafka 1280M · scylla 2048M · producer 512M · consumer 2×512M
+#   kafka 1280M · scylla 3072M · producer 512M · consumer 2×512M
 #   prometheus 512M · grafana 512M · alertmanager 128M · kafka-exporter 128M
 #   loki 512M · promtail 128M · webviz 512M · caddy 128M
 #   ------------------------------------------------------------------
-#   TOPLAM 7.25 GB   (t3.large 8GB · işletim sistemine ~0.75GB pay)
+#   TOPLAM 8.25 GB   (m7i-flex.large · işletim sistemine görünen RAM 7.6GB)
 #
-# 0.75GB pay Ubuntu + Docker daemon için yeterli ama BOL DEĞİL. Bu bir
-# HESAP, ölçüm değil: limitler tavandır, gerçek kullanım genelde altında
-# kalır. Gerçek sunucuda `docker stats` ile doğrulanmalı; sıkışıklık
-# görülürse ilk kısılacak yer Grafana ve Prometheus (ikisi de demo
-# yükünde limitlerinin çok altında çalışır).
+# --- TOPLAM NEDEN FİZİKSEL RAM'DEN BÜYÜK (ve neden sorun değil) ---
 #
-# scylla'nın limiti (2G) ile --memory bayrağı (1500M) artık tutarlı; önceki
-# sürümde limit 2.5G, bayrak 2000M idi ve ikisi de bütçeyi şişiriyordu.
+# Faz 18'in bütçesi 7.25 GB idi ve ScyllaDB'ye 2G veriyordu. GERÇEK SUNUCUDA
+# ÖLÇTÜK: o değerle ScyllaDB hiç başlamıyor (gerekçe scylla servisinin
+# üstündeki not). Çalışan en küçük değer 3G çıktı, bu da toplamı 8.25 GB'a
+# taşıdı.
 #
-# 3 consumer replikası ya da Faz 3 benchmark'ı koşulacaksa t3.xlarge gerekir.
+# `deploy.resources.limits` bir REZERVASYON değil, TAVAN'dır: Docker o belleği
+# ayırmaz, yalnızca konteynerin aşmasını engeller. Tavanların toplamının
+# fiziksel RAM'i aşması, hepsinin AYNI ANDA tavana dayanması hâlinde risk
+# yaratır - bu iş yükünde gerçekleşmeyen bir senaryo (ScyllaDB'nin kendisi
+# `--memory 1500M` ile sınırlı, yani 3G tavanına hiç yaklaşmaz; tavan
+# seastar'ın pay hesabını doğru yapabilmesi için var).
+#
+# ÖLÇÜM, hesap değil - `docker stats` ile gerçek kullanım:
+#   (bu satır ilk ölçümden sonra doldurulacak)
+#
+# Sıkışıklık görülürse ilk kısılacak yer Grafana, Prometheus ve Loki: üçü de
+# demo yükünde limitlerinin çok altında çalışır.
+#
+# 3 consumer replikası ya da Faz 3 benchmark'ı koşulacaksa 4 vCPU / 16 GB
+# gerekir (m7i-flex.xlarge).
 
 services:
   kafka:
@@ -49,12 +61,42 @@ services:
 
   scylla:
     restart: unless-stopped
-    command: --smp 2 --memory 1500M --overprovisioned 1 --api-address 0.0.0.0
+    # --reserve-memory ZORUNLU, opsiyonel bir ayar değil.
+    #
+    # Seastar (ScyllaDB'nin altyapısı) kullanılabilir belleği şöyle hesaplar:
+    #
+    #     görünen = konteyner limiti − pay − ~166 MiB sabit gider
+    #
+    # ve pay verilmezse varsayılanı `max(1.5 GiB, %7)`'dir. Yani limiti
+    # büyütmek TEK BAŞINA işe yaramaz: pay da limitle birlikte büyür. 2G
+    # limitte görünen 500 MB'a, 3G limitte 1436 MB'a düşüyordu; ScyllaDB'nin
+    # `--memory 1500M` için ihtiyacı ise 1400 MiB. İkisinde de 30 MiB farkla
+    # başlamıyordu.
+    #
+    # BU GERÇEK SUNUCUDA ÖLÇÜLDÜ, hesaplanmadı. Faz 18'de bütçe 2.5G/2000M'den
+    # 2G/1500M'e indirilirken not düşülmüştü: "Bunun bir HESAP olduğu, ölçüm
+    # olmadığı ayrıca not edildi — gerçek sunucuda doğrulanmalı." İlk gerçek
+    # sunucuda tam da burada düştü.
+    #
+    # Neden payı 1G'de bırakıp limiti büyüttük, payı kısmak yerine: bu
+    # konteynerin içinde ScyllaDB'den başka şeyler de çalışıyor — JMX sunucusu
+    # (bir JVM), node_exporter, supervisord ve healthcheck'in her 10 saniyede
+    # başlattığı cqlsh (Python). Hepsi bu paydan besleniyor. Payı 384M'ye
+    # kısmak ScyllaDB'yi başlatırdı ama konteyneri OOM-kill'e açık bırakırdı.
+    #
+    # ARIZA BİÇİMİ SİNSİ: başlatma başarısız olduğunda supervisord üç denemeden
+    # sonra "gave up" diyor ama KONTEYNER AYAKTA KALIYOR. Docker'ın
+    # `restart: unless-stopped` politikası tetiklenmiyor, `docker compose ps`
+    # servisi "Up (unhealthy)" gösteriyor ve ona `service_healthy` ile bağlı
+    # olan consumer/prometheus/grafana/caddy sessizce hiç başlamıyor.
+    command: >-
+      --smp 2 --memory 1500M --reserve-memory 1G
+      --overprovisioned 1 --api-address 0.0.0.0
     deploy:
       resources:
         limits:
           cpus: "1.5"
-          memory: 2G
+          memory: 3G
 
   producer:
     restart: unless-stopped

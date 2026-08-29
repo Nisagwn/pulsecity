@@ -59,22 +59,25 @@ resource "aws_instance" "app" {
     instance_metadata_tags      = "disabled"
   }
 
-  # T3 KREDI MODU: `standard` - AWS varsayilani olan `unlimited` DEGIL.
+  # CPU KREDI MODU - yalnizca T ailesinde.
   #
-  # T3 burstable bir ailedir: t3.large'in TABAN performansi vCPU basina %30'dur,
-  # ustu CPU kredisiyle karsilanir. Varsayilan `unlimited` modda krediler
-  # bitince instance yavaslamaz - AWS ek ucret islemeye baslar (vCPU-saat
-  # basina). Bu is yuku surekli akan bir boru hattidir, yani CPU'yu surekli
-  # mesgul eder: `unlimited` birakmak fatura ust sinirini KALDIRIR ve
-  # README'deki "~60 USD/ay" hesabini gecersiz kilar.
+  # T ailesi (t2/t3/t3a/t4g) burstable'dir: taban performansin (t3.large icin
+  # vCPU basina %30) ustu CPU kredisiyle karsilanir. AWS varsayilani
+  # `unlimited`: krediler bitince instance yavaslamaz, vCPU-saat basina EK
+  # UCRET islemeye baslar. Surekli akan bir boru hattinda CPU hep mesgul
+  # oldugu icin bu, faturanin ust sinirini tamamen kaldirir. `standard` ise
+  # kredi bitince taban hiza duser - demo yavaslar, fatura ongorulebilir kalir.
   #
-  # `standard`: kredi bitince instance taban hizina duser. Demo yavaslar ama
-  # fatura ongorulebilir kalir. Ogrenme/demo ortaminda dogru takas budur;
-  # performans olcumu yapilacaksa burst'e degil, daha buyuk bir instance'a
-  # (t3.xlarge ya da m-ailesi) gecilmelidir - burst zaten SUREKLI yuk icin
-  # tasarlanmamistir.
-  credit_specification {
-    cpu_credits = "standard"
+  # NEDEN DINAMIK: credit_specification T ailesi DISINDA gecersizdir. Varsayilan
+  # tipimiz artik m7i-flex.large (bkz. variables.tf: Free Plan kisiti) ve
+  # "flex" tipler kredi sayaci kullanmaz - taban %40 CPU verir, ustune burst
+  # yapar, ek ucret mekanizmasi yoktur. Blogu kosulsuz birakmak, free-tier
+  # uygun tiple apply edildiginde hata verirdi.
+  dynamic "credit_specification" {
+    for_each = startswith(var.instance_type, "t") ? [1] : []
+    content {
+      cpu_credits = "standard"
+    }
   }
 
   root_block_device {

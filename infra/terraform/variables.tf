@@ -28,14 +28,29 @@ variable "repo_branch" {
 }
 
 # DEPLOY.md'deki boyutlandirma tablosunun koda dokulmus hali:
-#   t3.large  (2 vCPU / 8GB)  - sadece demo
-#   t3.xlarge (4 vCPU / 16GB) - benchmark de kosulacaksa
+#   m7i-flex.large (2 vCPU / 8GB)  - sadece demo, VARSAYILAN
+#   m7i-flex.xlarge / t3.xlarge (4 vCPU / 16GB) - benchmark de kosulacaksa
 # Free tier t2/t3.micro (1GB) bu proje icin CALISMAZ - tek basina ScyllaDB
 # 1.5GB istiyor.
+#
+# NEDEN t3.large DEGIL: AWS'in 2025 sonrasi hesap modelinde yeni hesaplar
+# "Free Plan" ile aciliyor ve bu plan, free-tier uygun OLMAYAN instance
+# tiplerini tamamen engelliyor. t3.large ile RunInstances su hatayla doner:
+#
+#   InvalidParameterCombination: The specified instance type is not eligible
+#   for Free Tier.
+#
+# Bu bir kota degil, plan kisitidir - kota artirma talebi ise yaramaz, hesabin
+# Paid Plan'a yukseltilmesi gerekir. m7i-flex.large ise free-tier uygun
+# listesinde ve AYNI belleyi veriyor (2 vCPU / 8 GB), ustelik daha yeni nesil:
+# taban CPU'su %40 (t3.large'da %30) ve kredi sayaci yok.
+#
+# Hesabin hangi tipleri kabul ettigini gormek icin:
+#   aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true
 variable "instance_type" {
-  description = "EC2 instance tipi."
+  description = "EC2 instance tipi. Free Plan hesaplarda free-tier uygun bir tip olmali."
   type        = string
-  default     = "t3.large"
+  default     = "m7i-flex.large"
 
   validation {
     # Bellek tabanli bir dogrulama Terraform'da mumkun degil; bilinen yetersiz

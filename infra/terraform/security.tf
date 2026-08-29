@@ -29,7 +29,7 @@ resource "aws_security_group" "app" {
 # degeri validation ile reddediliyor (bkz. variables.tf).
 resource "aws_vpc_security_group_ingress_rule" "ssh" {
   security_group_id = aws_security_group.app.id
-  description       = "SSH - yalnizca operatorun IP'si"
+  description       = "SSH - yalnizca operator IP adresi"
 
   cidr_ipv4   = var.allowed_ssh_cidr
   ip_protocol = "tcp"
