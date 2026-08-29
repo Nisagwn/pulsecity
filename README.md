@@ -1,5 +1,19 @@
 # PulseCity
+<div align="center">
 
+# 🏙️ PulseCity
+
+> Dağıtık ve gerçek zamanlı veri işleme platformu.
+
+<br />
+
+<img src="https://github.com/user-attachments/assets/9176b27f-6314-4524-8996-82aafe68e3d1" alt="PulseCity Demo" width="750" />
+
+<br />
+
+</div>
+
+---
 Go, Kafka ve ScyllaDB ile şehir içi trafik yoğunluğunu **saniyede 50.000 GPS
 ping'i** hızında, sıfır kayıpla işleyen gerçek zamanlı veri boru hattı —
 Uber/Yandex'in çözdüğü probleme benzer bir mimari. Canlı Leaflet haritası,
