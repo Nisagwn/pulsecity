@@ -23,6 +23,21 @@
 # tasidiklari icin tek tek incelenmeleri gerekir (ornegin
 # actions/upload-artifact v4 -> v7 girdi adlarini degistirebilir).
 
+# --- DURAKLATILDI (31 Agustos 2026) ---
+#
+# Asagidaki tum ekosistemlerde `open-pull-requests-limit` 0'a cekildi.
+# Bu, GitHub'in belgelenmis duraklatma yontemi: surum guncellemeleri icin
+# ARTIK PR ACILMAZ, ama yapilandirma (gruplama, etiketler, zamanlama)
+# oldugu gibi durur - devam etmek icin degerleri 3'e geri almak yeterli.
+#
+# NEDEN: major yukseltmeler bilerek gruplanmadigi icin (bkz. yukaridaki not)
+# her biri ayri PR aciyordu ve inceleme kapasitesinin uzerine cikti.
+#
+# DIKKAT: bu ayar GUVENLIK guncellemelerini DURDURMAZ. Dependabot security
+# update'leri bu limite tabi degildir ve akmaya devam eder - istenen de budur:
+# gurultu susar, acik bildirimi susmaz. Guvenlik PR'larini da kapatmak icin
+# depo ayarlarindan (Settings > Code security) ayrica kapatmak gerekir.
+
 version: 2
 updates:
   # --- Base imajlar (digest ve surum guncellemeleri) ---
@@ -30,7 +45,7 @@ updates:
     directory: "/producer"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     groups:
       base-images:
         patterns: ["*"]
@@ -41,7 +56,7 @@ updates:
     directory: "/consumer"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     groups:
       base-images:
         patterns: ["*"]
@@ -52,7 +67,7 @@ updates:
     directory: "/webviz"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     groups:
       base-images:
         patterns: ["*"]
@@ -65,7 +80,7 @@ updates:
     directory: "/producer"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     groups:
       go-dependencies:
         patterns: ["*"]
@@ -76,7 +91,7 @@ updates:
     directory: "/consumer"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     groups:
       go-dependencies:
         patterns: ["*"]
@@ -87,7 +102,7 @@ updates:
     directory: "/webviz"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     groups:
       go-dependencies:
         patterns: ["*"]
@@ -101,7 +116,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     groups:
       github-actions:
         patterns: ["*"]
@@ -114,7 +129,7 @@ updates:
     directory: "/infra/terraform"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     groups:
       terraform-providers:
         patterns: ["*"]
