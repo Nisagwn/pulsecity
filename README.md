@@ -23,6 +23,14 @@ kurulumu dahil.
 Ölçülen (Faz 3): **50.477 msg/sn** işlenen · **0** kayıp · **0** DLQ ·
 ScyllaDB yazma p99 **48,4 ms**
 
+> Ölçüm bağlamı: Faz 3 benchmark'ı `deploy/docker-compose.bench.yml` ile
+> **20.000 sanal araç / 8 producer worker**, tek Kafka broker (12 partition),
+> tek node ScyllaDB ve 1 consumer replikasıyla koşuldu. p99, 2000 mesajlık
+> **batch başına** yazma süresidir. Bu koşuda "0 kayıp" producer hata oranı ve
+> DLQ oranının 0 olmasına dayanır; satır düzeyinde zero-loss doğrulaması
+> (SIGKILL testi) Faz 2'de 5.000 msg/sn'de yapıldı. Günlük `docker-compose.yml`
+> profili 2.000 araç / 5.000 msg/sn'dir.
+
 ## Mimari
 
 ```mermaid
@@ -30,7 +38,7 @@ flowchart TB
 
     subgraph P1["Yol 1 · VERİ — garanti: hiçbir mesaj sessizce kaybolmaz"]
         direction LR
-        PR["<b>producer</b><br/>Go · 2000 sanal araç<br/>acks = All"]
+        PR["<b>producer</b><br/>Go · 2000 sanal araç (yerel profil)<br/>acks = All"]
         KF["<b>Kafka</b><br/>12 partition · KRaft<br/>key = zone_id"]
         CO["<b>consumer</b><br/>zone bazlı UnloggedBatch<br/>EMA anomali · manuel commit"]
         SC["<b>ScyllaDB</b><br/>PK zone_id, ping_time, vehicle_id<br/>TTL 1 saat · TWCS"]
@@ -121,6 +129,9 @@ zero-loss veri yolunun üzerine oturmaz, dolayısıyla biri düşünce diğeri d
                      │  TTL 1 saat · TWCS 10 dakika pencere │
                      └──────────────────────────────────────┘
 ```
+
+*Araç sayısı yerel profile aittir (`docker-compose.yml`: 2.000 araç, 5.000 msg/sn).
+Faz 3 benchmark'ı 20.000 araç ve 50.000 msg/sn ile koşulur (`deploy/docker-compose.bench.yml`).*
 
 ### Gözlemlenebilirlik yolu
 
@@ -324,8 +335,17 @@ Uçtan uca happy-path: producer → Kafka → consumer → ScyllaDB. `docker-com
 | DLQ oranı | **0** |
 
 Test ortamı: Docker'a ayrılmış 12 çekirdek / 7,6 GB · Kafka tek broker (KRaft, 12 partition) ·
-ScyllaDB tek node RF=1 (4 shard / 2,5 GB) · 1 consumer replikası. Ölçüm sırasında anomali
+ScyllaDB tek node RF=1 (4 shard / 2,5 GB) · 1 consumer replikası · producer 20.000 sanal araç,
+8 worker (`deploy/docker-compose.bench.yml`). Ölçüm sırasında anomali
 demo modu kapalıdır (yapay tıkanıklık bölgesel hız metriklerini bozar).
+
+Metriklerin tanımı: throughput değerleri ölçüm sonunda Prometheus'tan alınan `rate(...[1m])`
+değerleridir. Gecikme `pulsecity_consumer_batch_write_seconds` histogramından gelir; bu süre
+tek bir satırın değil, en fazla 2000 mesajlık bir batch'in (JSON ayrıştırma + zone bazlı
+paralel yazma + gerekirse DLQ) toplam süresidir ve Prometheus'un varsayılan kovalarından
+(`DefBuckets`) `histogram_quantile` ile hesaplanır. Bu koşuda satır sayımı yapılmadı;
+"kayıp yok" sonucu producer hata oranı ve DLQ oranının 0 olmasına ve lag'in düzenli olarak
+0'a inmesine dayanır (satır düzeyinde doğrulama: Faz 2).
 
 **Consumer geride kalmıyor.** Lag'i 10 saniye aralıklarla örnekledim:
 16.500 → 48.000 → 32.000 → 29.500 → **0** → 48.000 mesaj. Bu testere dişi deseni batch'leme
@@ -354,6 +374,7 @@ docker compose -f docker-compose.yml -f deploy/docker-compose.bench.yml up -d --
 
 ### Faz 6 — Canlıya Alma (Deployment) ✅
 - `deploy/docker-compose.prod.yml`: kaynak limitleri, restart policy, 3 consumer replikası
+  (Faz 18'de bellek bütçesi nedeniyle 2 replikaya indirildi)
 - `deploy/nginx.conf`: Grafana'yı tek bir public port (80) üzerinden dışa açar
 - `deploy/DEPLOY.md`: adım adım VPS kurulum rehberi (Hetzner/DigitalOcean, 2vCPU/4GB yeterli)
 
@@ -380,6 +401,10 @@ Sistemi "veri taşıyan" seviyesinden "veriden anlam çıkaran" seviyeye taşıy
 
 Ölçülen sonuç: producer `istanbul-sisli-1`'i tıkadıktan **1 saniye sonra** consumer yakaladı
 (8.0 km/h vs öğrenilen normal 37.6 km/h), tıkanıklık boyunca baseline 37.6'da sabit kaldı.
+*(Bu ölçüm eski "ilçe × alt bölge" şemasıyla yapıldı; güncel kodda bölgeler 9 ilçedir ve
+`istanbul-sisli-1` artık yoktur. Haritadaki anomali halkası bu sinyali Prometheus üzerinden
+okur, yani haritada görünmesi ayrıca scrape aralığı (5 sn) + yayın aralığı (1 sn) kadar
+gecikebilir.)*
 
 ### Faz 9 — Canlı Harita ✅
 Grafana'nın sayısal grafiklerinin yanına, trafiği gerçekten *görebildiğin* bir katman.
@@ -422,6 +447,12 @@ hareket etmesine yol açıyordu. Ayrıca boylam enleme göre ölçeklenmiyordu (
 | `integration` | Düşük yükle tüm stack'i ayağa kaldırır; producer üretiyor mu, consumer işliyor mu, DLQ boş mu, ScyllaDB'ye yazılıyor mu, 9 bölge var mı, Faz 8 baseline üretiliyor mu, harita 200 dönüyor mu — hepsini doğrular, sonra temizler |
 | `docker-push` | Sadece `main`'e push'ta: 3 imajı GHCR'a yayınlar (ek secret gerekmez, `GITHUB_TOKEN` yeterli) |
 | `deploy` | **Pasif.** Elle tetikleme + `DEPLOY_ENABLED=true` repository variable olmadan çalışmaz |
+
+Sonraki fazlarda iş akışına `secrets-hygiene` (Faz 15), `security` (Trivy + SBOM, Faz 13) ve
+`iac` (Terraform fmt/validate + Trivy, Faz 14) job'ları eklendi; `docker-push` artık
+`security` job'ına da bağlıdır. `deploy` job'ı bugün de sunucuda
+`docker compose ... up -d --build` çalıştırır — Faz 18'in blue-green geçişi bu job'a
+bağlı değildir, `./scripts/deploy-webviz.sh` ile elle çalıştırılır.
 
 Ayrıca build altyapısı düzeltildi: `go.sum` dosyaları eklendi ve Dockerfile'lar
 `go mod tidy` yerine `go mod download` kullanacak şekilde yeniden yazıldı — build artık
@@ -518,6 +549,9 @@ patlasa kimse haberdar olmaz), ScyllaDB TTL ve Kafka `retention.bytes` politikas
 Ayrıca çifte-hata anında commit etmeme davranışının **birim testi yok**:
 `writeBatchToScylla` somut `*gocql.Session` ve `*kafka.Writer` aldığı için
 sahtelenemiyor; Faz 11'in `historyQuerier` deseni buraya da uygulanabilir.
+
+*Güncel durum: alarm kuralları, TTL/retention ve `log/slog` Faz 13'te eklendi. Çifte-hata
+anında commit etmeme davranışının birim testi hâlâ yoktur.*
 
 ### Faz 13 — DevOps Sertleştirmesi ✅
 Faz 12 sistemi *dayanıklı* hale getirdi. Bu faz onu *işletilebilir* yapar:
@@ -632,6 +666,9 @@ güvenle uygulanabiliyor.
 **Hâlâ eksik olan:** IaC (Terraform — `deploy/DEPLOY.md` hâlâ elle SSH adımları),
 secret yönetimi (`.env` seviyesinde, SOPS/Vault yok), TLS, log toplama
 (Loki/Promtail), ve çifte-hata anında commit etmeme davranışının birim testi.
+
+*Güncel durum: Terraform Faz 14'te, SOPS Faz 15'te, TLS Faz 16'da, Loki/Promtail Faz 17'de
+eklendi. Çifte-hata birim testi hâlâ yoktur.*
 
 ### Faz 14 — Altyapı Kod Olarak (Terraform) ✅
 Faz 13'e kadar `deploy/DEPLOY.md` bir **runbook**'tu: SSH ile bağlan, `apt
@@ -880,9 +917,10 @@ durdurularak gerçek `ERROR` üretildi ve dashboard panelinin sorgusu
 
 ### Faz 18 — Blue-Green Deploy (alarm tabanlı rollback) ✅
 Faz 10'daki deploy job'ı `docker compose up -d --build` çalıştırıyordu: imaj
-yeniden derlenirken konteyner duruyor, kısa bir kesinti oluşuyordu. Bu faz onu
-kesintisiz hale getirir — ve bir adım öteye giderek **rollback kararını
-otomatikleştirir**.
+yeniden derlenirken konteyner duruyor, kısa bir kesinti oluşuyordu. Bu faz
+webviz için kesintisiz bir geçiş yolu ekler (`./scripts/deploy-webviz.sh`,
+elle çalıştırılır; CI'daki `deploy` job'ı değişmedi) — ve bir adım öteye
+giderek **rollback kararını otomatikleştirir**.
 
 **Kapsam bilerek dar: yalnızca webviz.** Consumer zaten `--scale consumer=3`
 ile yatay ve Kafka consumer group'u rebalance'ı kendisi yönetiyor; bir replika
@@ -912,11 +950,17 @@ partition'ları ikiye böler ve her iki harita da akışın yalnızca yarısın�
 görürdü.
 
 **Asıl nokta: rollback kararı alarma dayanıyor.** Geçişten sonra bir gözlem
-penceresi boyunca üç şey izleniyor: Alertmanager'da `critical` alarm çıktı mı,
-green sağlıklı kaldı mı, ve green **gerçekten Kafka'dan okuyor mu**
-(`pulsecity_webviz_messages_consumed_total` artıyor mu). Üçüncüsü önemli —
-ayakta ama sessizce boş harita servis eden bir sürüm, en sinsi başarısızlık
-biçimidir; sağlık kontrolü onu yakalamaz.
+penceresi boyunca iki şeye göre otomatik rollback yapılır: Alertmanager'da
+`critical` alarm çıktı mı, ve green çalışıyor ve sağlıklı mı (`docker inspect`
+ile durum + healthcheck). Ayakta ama sessizce boş harita servis eden bir sürüm
+en sinsi başarısızlık biçimidir; sağlık kontrolü onu yakalamaz.
+
+> **Bilinen sınırlama:** betik her adımda
+> `sum(pulsecity_webviz_messages_consumed_total)` değerini **yalnızca ekrana
+> yazar**; bu değere göre rollback kararı vermez. Ayrıca Prometheus yalnızca
+> `webviz:8080` hedefini scrape eder (`monitoring/prometheus.yml`), green'i
+> değil — bu yüzden "green gerçekten Kafka'dan okuyor mu" kontrolü şu an
+> otomatik değildir.
 
 Bu, Faz 13'teki alarm zinciri olmadan **yapılamazdı**. "Kötü gidiyor"un makine
 tarafından okunabilir bir tanımı olmadan otomatik rollback, tahmin olurdu.
@@ -1001,6 +1045,12 @@ idi), consumer 3→2 replika, Caddy'ye limit eklendi (hiç yoktu). Bütçe tablo
 `deploy/docker-compose.prod.yml` başına yazıldı. Bunun bir **hesap** olduğu,
 ölçüm olmadığı ayrıca not edildi — gerçek sunucuda `docker stats` ile
 doğrulanmalı.
+
+*Güncel durum (gerçek sunucuda ölçüldükten sonra):* ScyllaDB 2G limitle hiç
+başlamadı; limit 3G'ye çıkarıldı ve `--reserve-memory 1G` eklendi, hedef
+instance `m7i-flex.large` oldu ve tavanların toplamı **8.25 GB**'a çıktı.
+Gerçek `docker stats` ölçümü ve tavan toplamının neden sorun olmadığı
+`deploy/docker-compose.prod.yml` başındaki notta yazılı.
 
 ## Sonuçları doğrulama sırası
 
