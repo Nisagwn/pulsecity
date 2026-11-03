@@ -66,9 +66,14 @@
 # 3 consumer replikası ya da Faz 3 benchmark'ı koşulacaksa 4 vCPU / 16 GB
 # gerekir (m7i-flex.xlarge).
 
+# PORTLAR: Compose birleştirirken listeleri EKLER; override'daki `ports: []`
+# temel dosyadaki portları kapatmaz. Bu yüzden `!reset []` kullanılır
+# (Compose v2.24.4+). CI'daki `prod-ports` işi yalnızca Caddy'nin dışa
+# açık olduğunu doğrular.
 services:
   kafka:
     restart: unless-stopped
+    ports: !reset []   # dışa kapalı; servisler iç ağdan erişir
     deploy:
       resources:
         limits:
@@ -77,6 +82,7 @@ services:
 
   scylla:
     restart: unless-stopped
+    ports: !reset []   # dışa kapalı; servisler iç ağdan erişir
     # --reserve-memory ZORUNLU, opsiyonel bir ayar değil.
     #
     # Seastar (ScyllaDB'nin altyapısı) kullanılabilir belleği şöyle hesaplar:
@@ -116,7 +122,7 @@ services:
 
   producer:
     restart: unless-stopped
-    ports: []   # local'de disariya acilan 2112 portu, prod'da kapali - Prometheus internal network'ten erisir
+    ports: !reset []   # local'de disariya acilan 2112 portu, prod'da kapali - Prometheus internal network'ten erisir
     environment:
       # VARSAYILAN 50.000 DEĞİL, 5.000.
       #
@@ -157,7 +163,7 @@ services:
 
   prometheus:
     restart: unless-stopped
-    ports: []   # doğrudan dışa kapalı; arayüzüne SSH tüneli ile bakılır
+    ports: !reset []   # doğrudan dışa kapalı; arayüzüne SSH tüneli ile bakılır
     deploy:
       resources:
         limits:
@@ -168,7 +174,7 @@ services:
   # production kurulumu, gözlemlenebilirlik değil sadece grafik demektir.
   alertmanager:
     restart: unless-stopped
-    ports: []   # dışa kapalı; arayüzüne SSH tüneli ile bakılır
+    ports: !reset []   # dışa kapalı; arayüzüne SSH tüneli ile bakılır
     volumes:
       # Prod'da Slack alıcısı olan yapılandırma kullanılır. Webhook URL'si bu
       # dosyada DEĞİL — `slack_api_url_file` ile aşağıdaki dizinden okunuyor.
@@ -194,7 +200,7 @@ services:
   # Faz 17: log toplama.
   loki:
     restart: unless-stopped
-    ports: []   # disa kapali; erisim Grafana uzerinden
+    ports: !reset []   # disa kapali; erisim Grafana uzerinden
     deploy:
       resources:
         limits:
@@ -211,7 +217,7 @@ services:
 
   webviz:
     restart: unless-stopped
-    ports: []   # doğrudan dışa kapalı, Caddy üzerinden "/" olarak servis edilir
+    ports: !reset []   # doğrudan dışa kapalı, Caddy üzerinden "/" olarak servis edilir
     deploy:
       resources:
         limits:
@@ -220,7 +226,7 @@ services:
 
   grafana:
     restart: unless-stopped
-    ports: []   # doğrudan dışa kapalı, Caddy (deploy/Caddyfile) üzerinden /grafana/ olarak erişilir
+    ports: !reset []   # doğrudan dışa kapalı, Caddy (deploy/Caddyfile) üzerinden /grafana/ olarak erişilir
     environment:
       GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER}"
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"

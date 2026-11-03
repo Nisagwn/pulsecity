@@ -53,8 +53,9 @@ Inbound kuralları — sadece iki port:
 | HTTP | 80 | `0.0.0.0/0` | Nginx (harita + Grafana) |
 
 Kafka (9092), ScyllaDB (9042), Prometheus (9090) ve webviz (8080) portlarını
-**açma**. `docker-compose.prod.yml` bunları zaten host'a bind etmiyor; Security
-Group'ta da kapalı tutmak ikinci savunma katmanı.
+**açma**. `docker-compose.prod.yml` bunları `ports: !reset []` ile host'a bind etmiyor
+(düz `ports: []` yetmez: Compose listeleri birleştirir). CI'daki `prod-ports` işi bunu
+her commit'te doğrular. Security Group'ta da kapalı tutmak ikinci savunma katmanı.
 
 SSH'ı `0.0.0.0/0` yapma — sunucu dakikalar içinde brute-force taramasına düşer.
 
@@ -73,7 +74,7 @@ için 2. adımdaki `ufw` bölümünü atlayabilirsin.
 EC2'nin public IP'si instance her durdurulup başlatıldığında **değişir** —
 demo linkin bozulur ve `GRAFANA_ROOT_URL`'ü her seferinde güncellemen gerekir.
 EC2 konsolundan bir Elastic IP alıp instance'a bağlarsan IP sabitlenir
-(instance çalışırken ücretsizdir).
+(AWS, Şubat 2024'ten beri her public IPv4 adresi için, instance çalışırken de saatlik ücret alır).
 
 ## 1. Sunucu hazırlığı
 
