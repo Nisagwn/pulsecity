@@ -10,6 +10,29 @@ env:
   GO_VERSION: "1.26"
 
 jobs:
+  # --- Prod compose: yalnızca Caddy dışa açık olmalı ------------------------
+  # Compose override'da `ports: []` temel dosyadaki portları KAPATMAZ (listeler
+  # birleştirilir); `!reset []` gerekir. Bu iş birleşmiş yapılandırmayı kontrol eder.
+  prod-ports:
+    name: Prod portları (yalnızca Caddy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Birleşmiş prod yapılandırmasında yayınlanan portlar
+        run: |
+          docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml             config --no-interpolate --format json > /tmp/prod.json
+          python3 - <<'PY'
+          import json, sys
+          svcs = json.load(open("/tmp/prod.json"))["services"]
+          bad = {n: [p.get("published") for p in s.get("ports") or []]
+                 for n, s in svcs.items() if n != "caddy" and s.get("ports")}
+          if bad:
+              print("Dışa açık port bulunan servisler:", bad)
+              sys.exit(1)
+          print("OK: yalnızca caddy port yayınlıyor:",
+                [p.get("published") for p in svcs["caddy"]["ports"]])
+          PY
+
   # --- 1) Lint + derleme --------------------------------------------------
   lint-build:
     name: Lint & derleme (${{ matrix.module }})

@@ -129,8 +129,8 @@ resource "aws_instance" "app" {
 #
 # DEPLOY.md'nin notu: EC2'nin public IP'si instance her durdurulup
 # baslatildiginda DEGISIR. Demo linkini paylasacaksan bu kabul edilemez -
-# EIP adresi sabitler. Instance CALISIRKEN ucretsizdir; instance kapaliyken
-# ayrilmis IP icin ucret islemeye baslar (yine DEPLOY.md'de not edilmis).
+# EIP adresi sabitler. Subat 2024'ten beri AWS her public IPv4 adresi icin
+# (EIP dahil, instance calisirken de) saatlik ucret alir; bkz. VPC fiyatlandirmasi.
 resource "aws_eip" "app" {
   domain   = "vpc"
   instance = aws_instance.app.id
